@@ -169,6 +169,9 @@ resolve_image() {
         IMAGE_ID=$(docker image inspect --format '{{.Id}}' "$IMAGE" 2>/dev/null) || \
             die "cannot resolve IMAGE=$IMAGE after pull"
     fi
+    if [[ $IMAGE_ID =~ ^[0-9a-f]{64}$ ]]; then
+        IMAGE_ID="sha256:$IMAGE_ID"
+    fi
     [[ $IMAGE_ID == sha256:* ]] || die "Docker returned an invalid image ID for IMAGE=$IMAGE"
 }
 
