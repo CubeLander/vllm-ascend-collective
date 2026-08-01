@@ -390,7 +390,7 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> npu_moe_init_routing_
     // symbolic-meta-ok: active_expert_range is an IntArrayRef schema argument, not a Tensor shape.
     int64_t active_expert_range_length = active_expert_range.size();
     TORCH_CHECK(active_expert_range_length == LENGTH_ACTIVE_EXPERT_RANGE, "The active_expert_range should be ", LENGTH_ACTIVE_EXPERT_RANGE,
-                "-Dimension, current is ", expert_idx_dim, "-Dimension.");
+                "-Dimension, current is ", active_expert_range_length, "-Dimension.");
 
     int expert_length = active_expert_range[1] - active_expert_range[0];
     auto bs = x.sym_size(0);

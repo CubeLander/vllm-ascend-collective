@@ -59,8 +59,8 @@ def has_exemption(lines: list[str], line_number: int) -> bool:
 def check_file(path: Path) -> list[str]:
     try:
         lines = path.read_text(encoding="utf-8").splitlines()
-    except (OSError, UnicodeDecodeError):
-        return []
+    except (OSError, UnicodeDecodeError) as error:
+        return [f"{path}: cannot read target file: {error}"]
 
     violations: list[str] = []
     for line_number, line in enumerate(lines, start=1):
