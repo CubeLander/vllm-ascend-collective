@@ -26,8 +26,7 @@ def test_reports_high_risk_concrete_shape(tmp_path: Path):
 def test_honors_exemption_with_reason(tmp_path: Path):
     target = tmp_path / "torch_binding_meta.cpp"
     target.write_text(
-        "// symbolic-meta-ok: schema argument, not a tensor shape\n"
-        "auto length = active_expert_range.size();\n",
+        "// symbolic-meta-ok: schema argument, not a tensor shape\nauto length = active_expert_range.size();\n",
         encoding="utf-8",
     )
 
