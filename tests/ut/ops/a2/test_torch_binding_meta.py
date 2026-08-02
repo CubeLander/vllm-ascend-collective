@@ -24,6 +24,19 @@ def _moe_gating_top_k(x: torch.Tensor):
     )
 
 
+def _moe_init_routing(x: torch.Tensor, expert_idx: torch.Tensor):
+    return torch.ops._C_ascend.npu_moe_init_routing_custom(
+        x,
+        expert_idx,
+        active_num=-1,
+        expert_num=64,
+        expert_tokens_num_type=1,
+        expert_tokens_num_flag=True,
+        active_expert_range=[0, 32],
+        quant_mode=-1,
+    )
+
+
 def test_moe_gating_top_k_preserves_dynamic_token_shape():
     compiled_graphs: list[torch.fx.GraphModule] = []
 
@@ -68,3 +81,34 @@ def test_moe_gating_top_k_preserves_dynamic_token_shape():
     assert isinstance(input_token_dim, torch.SymInt)
     assert all(isinstance(output.shape[0], torch.SymInt) for output in meta_outputs)
     assert all(str(output.shape[0]) == str(input_token_dim) for output in meta_outputs)
+
+
+def test_moe_init_routing_dropless_preserves_dynamic_token_shape():
+    compiled_graphs: list[torch.fx.GraphModule] = []
+
+    def record_graph(graph_module: torch.fx.GraphModule, _example_inputs):
+        compiled_graphs.append(graph_module)
+        return graph_module.forward
+
+    torch._dynamo.reset()
+    compiled = torch.compile(
+        _moe_init_routing,
+        backend=record_graph,
+        dynamic=True,
+        fullgraph=True,
+    )
+
+    try:
+        for num_tokens in (7, 13):
+            x = torch.empty((num_tokens, 64), device="meta", dtype=torch.bfloat16)
+            expert_idx = torch.empty((num_tokens, 4), device="meta", dtype=torch.int32)
+            expanded_x, expanded_row_idx, expert_tokens, expanded_scale = compiled(x, expert_idx)
+
+            assert expanded_x.shape == (num_tokens * 4, 64)
+            assert expanded_row_idx.shape == (num_tokens * 4,)
+            assert expert_tokens.shape == (32,)
+            assert expanded_scale.shape == (num_tokens * 4,)
+    finally:
+        torch._dynamo.reset()
+
+    assert len(compiled_graphs) == 1

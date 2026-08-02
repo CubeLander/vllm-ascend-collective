@@ -382,7 +382,6 @@ class TokenDispatcherWithAllGather(MoETokenDispatcher[MoEAllGatherCombineMetadat
         else:
             quant_mode = -1
 
-        num_tokens = hidden_states.shape[:-1].numel()
         apply_router_weight_on_input = token_dispatch_input.routing.apply_router_weight_on_input
         if apply_router_weight_on_input:
             assert topk_weights.dim() == 2, "`topk_weights` should be in shape (num_tokens, topk)"
@@ -403,7 +402,11 @@ class TokenDispatcherWithAllGather(MoETokenDispatcher[MoEAllGatherCombineMetadat
             hidden_states,
             topk_ids,
             scale=dynamic_scale,
-            active_num=num_tokens * self.top_k,
+            # This path consumes every routed token.  Using an equivalent
+            # shape-derived active_num forces torch.compile to specialize the
+            # dynamic token dimension at profile time; dropless mode preserves
+            # the symbolic batch while producing the same full output.
+            active_num=-1,
             expert_num=global_num_experts,
             expert_tokens_num_type=1,
             expert_tokens_num_flag=True,
