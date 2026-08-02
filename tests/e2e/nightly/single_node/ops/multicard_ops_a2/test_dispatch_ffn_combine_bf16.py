@@ -70,6 +70,7 @@ def _run_rank(rank: int, world_size: int, port: int) -> None:
             (local_experts,), tokens * top_k * world_size // global_experts, dtype=torch.int32
         )
 
+        probs_cpu = probs
         x = x.npu()
         expert_idx = expert_idx.npu()
         probs = probs.npu()
@@ -103,6 +104,48 @@ def _run_rank(rank: int, world_size: int, port: int) -> None:
 
             torch.testing.assert_close(out.cpu(), expected, rtol=0.02, atol=0.02)
             torch.testing.assert_close(expert_token_nums.cpu(), expected_tokens_per_local_expert)
+
+        # Reuse the same HCCL window with non-uniform, changing count rows.
+        # This catches stale producer publications that a repeated uniform
+        # assignment cannot distinguish from the current generation.
+        for generation, active_experts in enumerate((8, 17, 65, 127), start=1):
+            routes_by_rank = []
+            for source_rank in range(world_size):
+                source_routes = torch.arange(tokens * top_k, dtype=torch.int32)
+                source_routes = (source_routes * 11 + source_rank * 23 + generation * 7) % active_experts
+                source_routes = (source_routes + generation * 29) % global_experts
+                routes_by_rank.append(source_routes.reshape(tokens, top_k))
+
+            changing_expert_idx = routes_by_rank[rank]
+            changing_expected = torch.zeros_like(expected)
+            changing_expected[:, 0] = ((changing_expert_idx + 1) * probs_cpu).sum(dim=-1).to(torch.bfloat16) * silu_one
+            changing_expected_counts = torch.bincount(
+                torch.cat([routes.reshape(-1) for routes in routes_by_rank]),
+                minlength=global_experts,
+            ).to(torch.int32)
+            changing_expected_counts = changing_expected_counts[rank * local_experts : (rank + 1) * local_experts]
+
+            out.fill_(torch.nan)
+            expert_token_nums.fill_(-1)
+            torch.ops._C_ascend.dispatch_ffn_combine(
+                x=x,
+                weight1=weight1_nz,
+                weight2=weight2_nz,
+                expert_idx=changing_expert_idx.npu(),
+                scale1=scale1,
+                scale2=scale2,
+                bias1=empty_bias,
+                bias2=empty_bias,
+                probs=probs,
+                group=_get_hcomm_name(rank),
+                max_output_size=512,
+                out=out,
+                expert_token_nums=expert_token_nums,
+            )
+            torch_npu.npu.synchronize()
+
+            torch.testing.assert_close(out.cpu(), changing_expected, rtol=0.02, atol=0.02)
+            torch.testing.assert_close(expert_token_nums.cpu(), changing_expected_counts)
 
         # Graph replay pads a one-token runtime batch to a captured shape.
         # The inactive rows must not contribute expert work even when their
