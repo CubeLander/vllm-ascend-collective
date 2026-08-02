@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import pytest
 import torch
 
 from vllm_ascend.utils import enable_custom_op
@@ -34,6 +35,32 @@ def _moe_init_routing(x: torch.Tensor, expert_idx: torch.Tensor):
         expert_tokens_num_flag=True,
         active_expert_range=[0, 32],
         quant_mode=-1,
+    )
+
+
+def _dispatch_ffn_combine(x: torch.Tensor, x_active_mask: torch.Tensor):
+    num_tokens, hidden_size = x.shape
+    top_k = 2
+    empty = torch.empty(0, device=x.device)
+    expert_idx = torch.empty((num_tokens, top_k), device=x.device, dtype=torch.int32)
+    probs = torch.empty((num_tokens, top_k), device=x.device, dtype=torch.float32)
+    out = torch.empty((num_tokens, hidden_size), device=x.device, dtype=x.dtype)
+    expert_token_nums = torch.empty(4, device=x.device, dtype=torch.int32)
+    return torch.ops._C_ascend.dispatch_ffn_combine(
+        x,
+        [empty],
+        [empty],
+        expert_idx,
+        [empty],
+        [empty],
+        [empty],
+        [empty],
+        probs,
+        "meta-test-group",
+        128,
+        out,
+        expert_token_nums,
+        x_active_mask,
     )
 
 
@@ -112,3 +139,40 @@ def test_moe_init_routing_dropless_preserves_dynamic_token_shape():
         torch._dynamo.reset()
 
     assert len(compiled_graphs) == 1
+
+
+def test_dispatch_ffn_combine_preserves_dynamic_mask_shape():
+    compiled_graphs: list[torch.fx.GraphModule] = []
+
+    def record_graph(graph_module: torch.fx.GraphModule, _example_inputs):
+        compiled_graphs.append(graph_module)
+        return graph_module.forward
+
+    torch._dynamo.reset()
+    compiled = torch.compile(
+        _dispatch_ffn_combine,
+        backend=record_graph,
+        dynamic=True,
+        fullgraph=True,
+    )
+
+    try:
+        for num_tokens in (7, 13):
+            x = torch.empty((num_tokens, 64), device="meta", dtype=torch.bfloat16)
+            x_active_mask = torch.empty(num_tokens, device="meta", dtype=torch.bool)
+            out, expert_token_nums = compiled(x, x_active_mask)
+
+            assert out.shape == x.shape
+            assert expert_token_nums.shape == (4,)
+    finally:
+        torch._dynamo.reset()
+
+    assert len(compiled_graphs) == 1
+
+
+def test_dispatch_ffn_combine_rejects_mismatched_mask_shape():
+    x = torch.empty((7, 64), device="meta", dtype=torch.bfloat16)
+    x_active_mask = torch.empty(6, device="meta", dtype=torch.bool)
+
+    with pytest.raises(RuntimeError, match="x_active_mask must have one entry per input token"):
+        _dispatch_ffn_combine(x, x_active_mask)

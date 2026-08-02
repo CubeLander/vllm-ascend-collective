@@ -42,12 +42,17 @@ class TestPrepareAndFinalize(unittest.TestCase):
 
     @patch("vllm_ascend.ops.fused_moe.prepare_finalize.get_tensor_model_parallel_world_size", return_value=1)
     @patch("vllm_ascend.ops.fused_moe.prepare_finalize.get_tensor_model_parallel_rank", return_value=0)
+    @patch("vllm_ascend.ops.fused_moe.prepare_finalize.get_mc2_mask")
     @patch("vllm_ascend.ascend_forward_context.get_forward_context")
-    def test_mc2_prepare_finalize(self, mock_get_forward_context, mock_tp_rank, mock_tp_size):
+    def test_mc2_prepare_finalize(self, mock_get_forward_context, mock_get_mc2_mask, mock_tp_rank, mock_tp_size):
         mock_context = MagicMock()
+        # The context keeps a transient, current-batch view. prepare() must
+        # instead derive its result from the stable reserved buffer so a
+        # dynamic graph cannot capture this shorter view.
         mock_context.mc2_mask = torch.tensor([1, 0, 1])
         mock_context.padded_num_tokens = 4
         mock_get_forward_context.return_value = mock_context
+        mock_get_mc2_mask.return_value = torch.tensor([1, 0, 1, 0])
 
         layer = PrepareAndFinalizeWithMC2(self.moe_config)
 
@@ -63,7 +68,7 @@ class TestPrepareAndFinalize(unittest.TestCase):
         # Check padding and split
         self.assertEqual(h_out.shape[0], 4)
         self.assertEqual(r_out.shape[0], 4)
-        self.assertEqual(mask.tolist(), [1, 0, 1])
+        self.assertEqual(mask.tolist(), [1, 0, 1, 0])
         self.assertEqual(padded_hidden_states_shape, torch.Size([4, 8]))
 
         # Finalize
@@ -72,13 +77,17 @@ class TestPrepareAndFinalize(unittest.TestCase):
 
     @patch("vllm_ascend.ops.fused_moe.prepare_finalize.get_tensor_model_parallel_world_size", return_value=2)
     @patch("vllm_ascend.ops.fused_moe.prepare_finalize.get_tensor_model_parallel_rank", return_value=0)
+    @patch("vllm_ascend.ops.fused_moe.prepare_finalize.get_mc2_mask")
     @patch("vllm_ascend.ascend_forward_context.get_forward_context")
     @patch("torch.distributed.all_gather")
-    def test_mc2_tp_split_allgather(self, mock_all_gather, mock_get_forward_context, mock_tp_rank, mock_tp_size):
+    def test_mc2_tp_split_allgather(
+        self, mock_all_gather, mock_get_forward_context, mock_get_mc2_mask, mock_tp_rank, mock_tp_size
+    ):
         mock_context = MagicMock()
         mock_context.mc2_mask = torch.tensor([1, 0, 1, 0])
         mock_context.padded_num_tokens = 4
         mock_get_forward_context.return_value = mock_context
+        mock_get_mc2_mask.return_value = torch.tensor([1, 0, 1, 0])
 
         layer = PrepareAndFinalizeWithMC2(self.moe_config)
         hidden_states = torch.randn(4, 8)
@@ -92,6 +101,7 @@ class TestPrepareAndFinalize(unittest.TestCase):
 
         # With TP=2, should split into 2 parts
         self.assertEqual(h_out.shape[0], 2)
+        self.assertEqual(prepare_output.mc2_mask.tolist(), [1, 0])
         self.assertEqual(padded_hidden_states_shape, torch.Size([4, 8]))
 
         # Mock all_gather behavior
@@ -108,6 +118,30 @@ class TestPrepareAndFinalize(unittest.TestCase):
 
         # Should concat back to original size
         self.assertEqual(final_result.shape[0], 4)
+
+    @patch("vllm_ascend.ops.fused_moe.prepare_finalize.get_tensor_model_parallel_world_size", return_value=2)
+    @patch("vllm_ascend.ops.fused_moe.prepare_finalize.get_tensor_model_parallel_rank", return_value=1)
+    @patch("vllm_ascend.ops.fused_moe.prepare_finalize.get_mc2_mask")
+    @patch("vllm_ascend.ascend_forward_context.get_forward_context")
+    def test_mc2_tp_split_uses_rank_mask_slice(
+        self, mock_get_forward_context, mock_get_mc2_mask, mock_tp_rank, mock_tp_size
+    ):
+        mock_context = MagicMock()
+        mock_context.mc2_mask = torch.tensor([1, 0, 0, 1])
+        mock_context.padded_num_tokens = 4
+        mock_get_forward_context.return_value = mock_context
+        mock_get_mc2_mask.return_value = torch.tensor([1, 0, 0, 1])
+
+        layer = PrepareAndFinalizeWithMC2(self.moe_config)
+        prepare_output = layer.prepare(
+            torch.randn(4, 8),
+            torch.randn(4, 2),
+            enable_shared_expert_dp=False,
+            replace_allreduce=False,
+        )
+
+        self.assertEqual(prepare_output.hidden_states.shape[0], 2)
+        self.assertEqual(prepare_output.mc2_mask.tolist(), [0, 1])
 
     @patch("vllm_ascend.ops.fused_moe.prepare_finalize.get_tensor_model_parallel_world_size", return_value=1)
     @patch("vllm_ascend.ops.fused_moe.prepare_finalize.get_tensor_model_parallel_rank", return_value=0)
