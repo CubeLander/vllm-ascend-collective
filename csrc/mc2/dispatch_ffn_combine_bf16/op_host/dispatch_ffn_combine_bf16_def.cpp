@@ -84,7 +84,7 @@ class DispatchFFNCombineBF16 : public OpDef {
         .ExtendCfgInfo("jitCompile.flag", "static_false")
         .ExtendCfgInfo("multiKernelSupportDynamicGraph.value", "multi_kernel");
     this->AICore().AddConfig("ascend910_93", aicore_config);
-    // this->AICore().AddConfig("ascend910b", aicore_config);
+    this->AICore().AddConfig("ascend910b", aicore_config);
     this->MC2().HcclGroup("group");
   }
 };
