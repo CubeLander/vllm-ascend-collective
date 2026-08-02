@@ -248,11 +248,14 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
         # or None for scales in non-quantized scenarios.
         if _EXTRA_CTX.moe_comm_type == MoECommType.FUSED_MC2:
             w1 = [layer.w13_weight]
-            w1_scale = [torch.tensor([], dtype=torch.int64)]
+            # Keep the mandatory empty BF16 placeholders on the same device as
+            # the real operands.  CPU placeholders make FakeTensor propagation
+            # reject the fused op during torch.compile graph capture.
+            w1_scale = [layer.w13_weight.new_empty((0,), dtype=torch.int64)]
             w2 = [layer.w2_weight]
-            w2_scale = [torch.tensor([], dtype=torch.int64)]
-            w1_scale_bias = [torch.tensor([], dtype=torch.float32)]
-            w2_scale_bias = [torch.tensor([], dtype=torch.float32)]
+            w2_scale = [layer.w2_weight.new_empty((0,), dtype=torch.int64)]
+            w1_scale_bias = [layer.w13_weight.new_empty((0,), dtype=torch.float32)]
+            w2_scale_bias = [layer.w2_weight.new_empty((0,), dtype=torch.float32)]
         else:
             w1 = layer.w13_weight
             w1_scale = None

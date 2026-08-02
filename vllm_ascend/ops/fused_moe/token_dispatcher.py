@@ -355,19 +355,6 @@ class TokenDispatcherWithAllGather(MoETokenDispatcher[MoEAllGatherCombineMetadat
         self.num_experts_local = (
             num_experts_local.item() if torch.is_tensor(num_experts_local) else int(num_experts_local)
         )
-        self.ep_rank_id = int(kwargs.get("ep_rank", 0))
-        self.ep_world_size = int(kwargs.get("ep_size", 1))
-        if self.num_experts_local <= 0:
-            raise ValueError("`num_local_experts` must be positive")
-        if not 0 <= self.ep_rank_id < self.ep_world_size:
-            raise ValueError("`ep_rank` must be within the expert parallel group")
-
-        # AllGather consumes physical expert IDs. Plain EP already lays them
-        # out contiguously, while EPLB maps logical IDs to the same physical
-        # layout through log2phy before dispatch.
-        self.global_num_experts = self.num_experts_local * self.ep_world_size
-        self.first_expert_idx = self.ep_rank_id * self.num_experts_local
-        self.last_expert_idx = self.first_expert_idx + self.num_experts_local
 
     def token_dispatch(
         self,
@@ -384,7 +371,9 @@ class TokenDispatcherWithAllGather(MoETokenDispatcher[MoEAllGatherCombineMetadat
         hidden_states = token_dispatch_input.hidden_states
         topk_weights = token_dispatch_input.topk_weights
         topk_ids = token_dispatch_input.topk_ids
+        expert_map = token_dispatch_input.routing.expert_map
         dynamic_scale = token_dispatch_input.routing.pertoken_scale
+        global_redundant_expert_num = token_dispatch_input.routing.global_redundant_expert_num
         restore_shape = hidden_states.shape
         # Fuse the first dynamic quant of moe_mlp into initrouting when
         # dispatch_with_quant is on but got a None dynamic_scale.
@@ -399,22 +388,26 @@ class TokenDispatcherWithAllGather(MoETokenDispatcher[MoEAllGatherCombineMetadat
             _, topk = topk_weights.shape
             assert topk == 1, "Only support topk=1 when `apply_router_weight_on_input` is True"
             hidden_states = hidden_states * topk_weights.to(hidden_states.dtype)
-        if self.ep_world_size > 1:
-            first_expert_idx = self.first_expert_idx
-            last_expert_idx = self.last_expert_idx
-            mask = (topk_ids >= first_expert_idx) & (topk_ids < last_expert_idx)
+        if expert_map is not None:
+            global_num_experts = len(expert_map) + global_redundant_expert_num
+            mask = expert_map[topk_ids] != -1
             topk_weights = topk_weights * mask
+            first_expert_idx = get_ep_group().rank_in_group * self.num_experts_local
+            last_expert_idx = first_expert_idx + self.num_experts_local
         else:
             first_expert_idx = 0
             last_expert_idx = self.num_experts_local
+            global_num_experts = self.num_experts_local
         sorted_hidden_states, expanded_row_idx, expert_tokens, dynamic_scale = DeviceOperator.npu_moe_init_routing(
             hidden_states,
             topk_ids,
             scale=dynamic_scale,
-            # Zero means all routed tokens. Keeping this scalar static avoids
-            # specializing the graph on a dynamic token count.
-            active_num=0,
-            expert_num=self.global_num_experts,
+            # This path consumes every routed token.  Using an equivalent
+            # shape-derived active_num forces torch.compile to specialize the
+            # dynamic token dimension at profile time; dropless mode preserves
+            # the symbolic batch while producing the same full output.
+            active_num=-1,
+            expert_num=global_num_experts,
             expert_tokens_num_type=1,
             expert_tokens_num_flag=True,
             active_expert_range=[first_expert_idx, last_expert_idx],
