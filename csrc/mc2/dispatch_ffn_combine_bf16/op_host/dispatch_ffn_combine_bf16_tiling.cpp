@@ -39,6 +39,7 @@ namespace {
     constexpr uint32_t WEIGHT_INDEX = 1;
     constexpr uint32_t WEIGHT2_INDEX = 2;
     constexpr uint32_t EXPERTID_INDEX = 3;
+    constexpr uint32_t X_ACTIVE_MASK_INDEX = 7;
     constexpr uint32_t BLOCK_NUM = 20;
     constexpr uint32_t SYSTEM_NEED_WORKSPACE = 16 * 1024 * 1024;
     constexpr uint64_t MB_SIZE = 1024 * 1024UL;
@@ -143,6 +144,22 @@ static ge::graphStatus DispatchFFNCombineBF16GetPlatformInfoAndSetTiling(gert::T
     return ge::GRAPH_SUCCESS;
 }
 
+static ge::graphStatus CheckXActiveMaskShape(gert::TilingContext *context, const char *nodeName,
+                                             DispatchFFNCombineBF16Info &info)
+{
+    const gert::StorageShape *xActiveMaskStorageShape = context->GetOptionalInputShape(X_ACTIVE_MASK_INDEX);
+    if (xActiveMaskStorageShape != nullptr) {
+        OP_TILING_CHECK(xActiveMaskStorageShape->GetStorageShape().GetDimNum() != 1,
+            OP_LOGE(nodeName, "xActiveMask shape dims must be 1, but current dim num is %lu.",
+                xActiveMaskStorageShape->GetStorageShape().GetDimNum()), return ge::GRAPH_FAILED);
+        const int64_t xActiveMaskDim0 = xActiveMaskStorageShape->GetStorageShape().GetDim(0);
+        OP_TILING_CHECK(xActiveMaskDim0 != static_cast<int64_t>(info.M),
+            OP_LOGE(nodeName, "xActiveMask Dim0 must be M(%u), but current dim is %ld.", info.M, xActiveMaskDim0),
+            return ge::GRAPH_FAILED);
+    }
+    return ge::GRAPH_SUCCESS;
+}
+
 void SetTilingData(CoCTiling &cocTilingData, DispatchFFNCombineBF16Info &info)
 {
     cocTilingData.m0 = 128;
@@ -179,6 +196,9 @@ static ge::graphStatus DispatchFFNCombineBF16TilingFuncImpl(gert::TilingContext 
     OP_TILING_CHECK(DispatchFFNCombineBF16GetPlatformInfoAndSetTiling(context, info) != ge::GRAPH_SUCCESS,
         OP_LOGE(context->GetNodeName(), "DispatchFFNCombineBF16 GetPlatformInfoAndSetTiling Failed"),
         return ge::GRAPH_FAILED);
+    OP_TILING_CHECK(CheckXActiveMaskShape(context, nodeName, info) != ge::GRAPH_SUCCESS,
+        OP_LOGE(context->GetNodeName(), "DispatchFFNCombineBF16 CheckXActiveMaskShape Failed"),
+        return ge::GRAPH_FAILED);
 
     SetTilingData(tilingData->cocTiling, info);
 
@@ -203,7 +223,10 @@ static ge::graphStatus DispatchFFNCombineBF16TilingFuncImpl(gert::TilingContext 
     int64_t scaleDim0 = 0;
     int64_t ubSize = 196352;
     int64_t expertCapacity = 0;
-    int64_t expertNum = info.expertPerRank * info.worldSize;
+    // Reserve one sentinel expert for masked graph-padding rows. The routing
+    // stage sorts those rows after all real experts; downstream compute and
+    // communication continue to consume only the real expert range.
+    int64_t expertNum = info.expertPerRank * info.worldSize + 1;
     int64_t activeNum = info.M * info.topK;
     int64_t dropPadMode = 0;
      int64_t expertTokensCountOrCumsumFlag = 2;

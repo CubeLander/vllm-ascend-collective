@@ -31,7 +31,10 @@ def _run_rank(rank: int, world_size: int, port: int) -> None:
     )
 
     try:
-        local_experts = 8
+        # Keep EP * local_experts exactly on the 128-entry alignment
+        # boundary. Reserving the masked-row sentinel must therefore expand
+        # the peer token-count stride rather than alias the next rank.
+        local_experts = 64
         tokens = 64
         top_k = 4
         hidden_size = 256
@@ -100,6 +103,44 @@ def _run_rank(rank: int, world_size: int, port: int) -> None:
 
             torch.testing.assert_close(out.cpu(), expected, rtol=0.02, atol=0.02)
             torch.testing.assert_close(expert_token_nums.cpu(), expected_tokens_per_local_expert)
+
+        # Graph replay pads a one-token runtime batch to a captured shape.
+        # The inactive rows must not contribute expert work even when their
+        # route IDs name otherwise valid experts.
+        active_tokens = 1
+        x_active_mask = torch.zeros(tokens, dtype=torch.bool)
+        x_active_mask[:active_tokens] = True
+        masked_routes = []
+        for source_rank in range(world_size):
+            source_expert_idx = torch.arange(tokens * top_k, dtype=torch.int32).reshape(tokens, top_k)
+            source_expert_idx = (source_expert_idx + source_rank * top_k) % global_experts
+            masked_routes.append(source_expert_idx[:active_tokens].reshape(-1))
+        expected_masked_counts = torch.bincount(torch.cat(masked_routes), minlength=global_experts).to(torch.int32)
+        expected_masked_counts = expected_masked_counts[rank * local_experts : (rank + 1) * local_experts]
+
+        masked_expert_idx = expert_idx.clone()
+        out.fill_(torch.nan)
+        expert_token_nums.fill_(-1)
+        torch.ops._C_ascend.dispatch_ffn_combine(
+            x=x,
+            weight1=weight1_nz,
+            weight2=weight2_nz,
+            expert_idx=masked_expert_idx,
+            scale1=scale1,
+            scale2=scale2,
+            bias1=empty_bias,
+            bias2=empty_bias,
+            probs=probs,
+            group=_get_hcomm_name(rank),
+            max_output_size=512,
+            x_active_mask=x_active_mask.npu(),
+            out=out,
+            expert_token_nums=expert_token_nums,
+        )
+        torch_npu.npu.synchronize()
+
+        torch.testing.assert_close(out[:active_tokens].cpu(), expected[:active_tokens], rtol=0.02, atol=0.02)
+        torch.testing.assert_close(expert_token_nums.cpu(), expected_masked_counts)
     finally:
         dist.destroy_process_group()
 
