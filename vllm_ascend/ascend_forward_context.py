@@ -249,11 +249,11 @@ def select_moe_comm_method(num_tokens: int, vllm_config: VllmConfig, is_draft_mo
 
     1. Non-MoE models return `None`.
     2. Without expert parallel, fall back to all-gather.
-    3. On A2 with expert parallel, use the floating-point fused MC2 path when
-       explicitly enabled for a small EP group with enough local experts for
-       the kernel pipeline and tokens fit the MC2 capacity. Otherwise, pick
-       MC2 when tokens fit the MC2 capacity and the DP size is large enough,
-       or fall back to all-gather.
+    3. On A2 with expert parallel, use the BF16 or W8A8 dynamic fused MC2 path
+       when explicitly enabled for a small EP group with enough local experts
+       for the kernel pipeline and tokens fit the MC2 capacity. Otherwise,
+       pick MC2 when tokens fit the MC2 capacity and the DP size is large
+       enough, or fall back to all-gather.
     4. On A3 with expert parallel, prefer fused MC2 when using w8a8_dynamic
        quantization with small EP size, no dynamic_eplb, and not in MTP
        mode; otherwise use MC2 within capacity or all-to-all.
@@ -291,14 +291,14 @@ def select_moe_comm_method(num_tokens: int, vllm_config: VllmConfig, is_draft_mo
             vllm_config.parallel_config.world_size_across_dp // vllm_config.parallel_config.pipeline_parallel_size
         )
         num_experts_per_device = num_experts // ep_world_size
-        fused_float_enable = (
+        fused_a2_enable = (
             get_ascend_config().enable_fused_mc2 == 1
-            and quant_type is None
+            and quant_type in (None, "w8a8_dynamic")
             and get_ep_group().world_size <= MAX_A2_FUSED_MC2_EP_SIZE
             and num_experts_per_device >= MIN_A2_FUSED_MC2_LOCAL_EXPERTS
             and num_tokens <= mc2_tokens_capacity
         )
-        if fused_float_enable:
+        if fused_a2_enable:
             moe_comm_type = MoECommType.FUSED_MC2
         elif num_experts_per_device <= 24 and ep_world_size >= 16 and num_tokens <= mc2_tokens_capacity:
             moe_comm_type = MoECommType.MC2

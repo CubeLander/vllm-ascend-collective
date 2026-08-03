@@ -320,8 +320,12 @@ class AscendW8A8DynamicFusedMoEMethod(AscendMoEScheme):
             w2 = [layer.w2_weight]
             w2_scale = [layer.fused_w2_scale] if fused_scale_flag else [layer.w2_weight_scale]
 
-        w1_scale_bias = [torch.tensor([], dtype=torch.float32)] if fused_scale_flag else None
-        w2_scale_bias = [torch.tensor([], dtype=torch.float32)] if fused_scale_flag else None
+        # The fused operator requires placeholder bias lists even though W8A8
+        # does not consume an additive bias.  Keep those placeholders on the
+        # activation device: CPU empties make FakeTensor propagation reject the
+        # fused node during torch.compile/ACL graph capture.
+        w1_scale_bias = [x.new_empty((0,), dtype=torch.float32)] if fused_scale_flag else None
+        w2_scale_bias = [x.new_empty((0,), dtype=torch.float32)] if fused_scale_flag else None
 
         final_hidden_states = moe_comm_method.fused_experts(
             fused_experts_input=build_fused_experts_input(
