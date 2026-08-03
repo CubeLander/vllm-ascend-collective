@@ -163,11 +163,12 @@ def _make_moe_config(ep_size: int, quant_type=None, num_experts: int = 16):
         (1, None, 2, 8, MoECommType.FUSED_MC2),
         (1, None, 2, 2, MoECommType.ALLGATHER),
         (0, None, 2, 8, MoECommType.ALLGATHER),
-        (1, "w8a8_dynamic", 2, 8, MoECommType.ALLGATHER),
+        (1, "w8a8_dynamic", 2, 8, MoECommType.FUSED_MC2),
+        (1, "w4a8_dynamic", 2, 8, MoECommType.ALLGATHER),
         (1, None, 16, 8, MoECommType.MC2),
     ],
 )
-def test_select_moe_comm_method_a2_fused_float(fused_mode, quant_type, ep_size, local_experts, expected):
+def test_select_moe_comm_method_a2_fused(fused_mode, quant_type, ep_size, local_experts, expected):
     vllm_config = _make_moe_config(ep_size, quant_type, num_experts=ep_size * local_experts)
     ep_group = SimpleNamespace(world_size=ep_size)
     ascend_config = SimpleNamespace(enable_fused_mc2=fused_mode)
