@@ -86,14 +86,11 @@ def _run_rank(rank: int, world_size: int, port: int) -> None:
 
         for generation in range(1, 5):
             routes_by_rank = [
-                _routes(tokens, top_k, global_experts, source_rank, generation)
-                for source_rank in range(world_size)
+                _routes(tokens, top_k, global_experts, source_rank, generation) for source_rank in range(world_size)
             ]
             expert_idx = routes_by_rank[rank]
             expected = torch.zeros((tokens, hidden_size), dtype=torch.bfloat16)
-            expected[:, 0] = (
-                (_expert_value(expert_idx) * probs_cpu).sum(dim=-1).to(torch.bfloat16) * silu_one
-            )
+            expected[:, 0] = (_expert_value(expert_idx) * probs_cpu).sum(dim=-1).to(torch.bfloat16) * silu_one
             expected_counts = torch.bincount(
                 torch.cat([routes.reshape(-1) for routes in routes_by_rank]),
                 minlength=global_experts,
@@ -146,9 +143,7 @@ def _run_rank(rank: int, world_size: int, port: int) -> None:
             expert_token_nums=expert_token_nums,
         )
         torch_npu.npu.synchronize()
-        torch.testing.assert_close(
-            expert_token_nums.cpu(), torch.zeros(local_experts, dtype=torch.int32)
-        )
+        torch.testing.assert_close(expert_token_nums.cpu(), torch.zeros(local_experts, dtype=torch.int32))
 
         # Reuse the same HCCL windows with only one real token in a graph-sized
         # buffer. Inactive rows must not contribute expert work.
@@ -156,17 +151,13 @@ def _run_rank(rank: int, world_size: int, port: int) -> None:
         x_active_mask = torch.zeros(tokens, dtype=torch.bool)
         x_active_mask[:active_tokens] = True
         routes_by_rank = [
-            _routes(tokens, top_k, global_experts, source_rank, generation=6)
-            for source_rank in range(world_size)
+            _routes(tokens, top_k, global_experts, source_rank, generation=6) for source_rank in range(world_size)
         ]
         expert_idx = routes_by_rank[rank]
         expected = torch.zeros((tokens, hidden_size), dtype=torch.bfloat16)
-        expected[:active_tokens, 0] = (
-            (_expert_value(expert_idx[:active_tokens]) * probs_cpu[:active_tokens])
-            .sum(dim=-1)
-            .to(torch.bfloat16)
-            * silu_one
-        )
+        expected[:active_tokens, 0] = (_expert_value(expert_idx[:active_tokens]) * probs_cpu[:active_tokens]).sum(
+            dim=-1
+        ).to(torch.bfloat16) * silu_one
         expected_counts = torch.bincount(
             torch.cat([routes[:active_tokens].reshape(-1) for routes in routes_by_rank]),
             minlength=global_experts,
