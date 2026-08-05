@@ -918,16 +918,16 @@ private:
         // the next phase while its peer is still consuming the prior phase.
         AscendC::SyncAll<true>();
         if (coreIdx == 0) {
-            __gm__ int32_t *localReady = reinterpret_cast<__gm__ int32_t *>(
+            __gm__ uint32_t *localReady = reinterpret_cast<__gm__ uint32_t *>(
                 shmem() + peermemInfo.offsetDirectIngressReady);
             gm_dcci(localReady);
-            int32_t epoch = gm_load(localReady) + 1;
+            uint32_t epoch = gm_load(localReady) + 1U;
             gm_store(localReady, epoch);
             gm_dcci(localReady);
 
             for (int32_t srcRank = 0; srcRank < params.EP; ++srcRank) {
-                __gm__ int32_t *remoteReady =
-                    reinterpret_cast<__gm__ int32_t *>(shmem(
+                __gm__ uint32_t *remoteReady =
+                    reinterpret_cast<__gm__ uint32_t *>(shmem(
                         peermemInfo.offsetDirectIngressReady, srcRank));
                 // A peer may leave this barrier and publish the next wave
                 // while this rank is still checking the current one. Match

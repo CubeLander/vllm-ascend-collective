@@ -50,9 +50,10 @@ cannot fit below the count-control region, the experiment fails closed to the
 original path.
 
 The count matrix and ingress epoch have disjoint, cache-line-aligned storage.
-The epoch is source-owned and independent of the existing egress completion
-state. A waiter accepts the requested epoch or one generation ahead, matching
-the existing barrier's bounded-skew rule and avoiding an exact-value ABA hang.
+The epoch is a source-owned unsigned 32-bit modular counter, independent of the
+existing egress completion state. A waiter accepts the requested epoch or one
+generation ahead, matching the existing barrier's bounded-skew rule and
+avoiding an exact-value ABA hang, including across `UINT32_MAX -> 0`.
 Payload cache maintenance is distributed by hardware cache line, so distinct
 cores never issue DCCI against the same line.
 
@@ -100,9 +101,17 @@ is derived as `EP * M * topK`: retaining EP2's 512-row constant at EP4 caused
 the expected one-destination truncation at 1,024 rows, while expert counts
 remained exact. Correcting that test precondition produced a clean 28-wave
 pilot and the full 2,048-wave pass. A tracked four-rank regression with 64
-local experts per rank (256 global experts) also passes. These results close
-the current EP4 and larger-topology correctness gates; signed epoch wrap and
-topologies beyond EP4/256 experts remain untested.
+local experts per rank (256 global experts) also passes.
+
+The ingress and existing barrier counters were then made explicitly `uint32_t`
+so their wrap semantics no longer depend on signed-overflow behavior. A clean
+four-variant rebuild was byte-identical to the previously validated selector
+objects, and the tracked EP2+EP4 regressions passed again. A disposable kernel
+seeded the ingress epoch at `UINT32_MAX - 2`; 14 changing EP2 generations
+crossed wrap and passed exact output and expert-count checks. The seed hook was
+not retained. These results close the current EP4, 256-expert, and modular
+epoch-wrap correctness gates; topologies beyond EP4/256 experts remain
+untested.
 
 ## First performance discrimination
 
@@ -222,8 +231,8 @@ production default because:
 2. the graph `active=1` selector is consistently faster, but its 4.34% median
    gain narrowly misses the preregistered 5% useful-effect target;
 3. the source-owned epoch assumes a fresh common initial generation and a
-   bounded one-wave skew; 2,048-generation communicator reuse passes, but
-   signed wrap still needs an adversarial test;
+   bounded one-wave skew; 2,048-generation communicator reuse and adversarial
+   unsigned wrap pass, but larger skew is outside the protocol;
 4. the DCCI ablation passes the current test but is not yet strong enough to
    replace the conservative visibility boundary; and
 5. the dense count exchange remains, even though per-expert receiver pulls and
@@ -248,9 +257,9 @@ not a substitute for a documented peer-write-to-Cube visibility contract. The
 conservative direct prototype therefore keeps DCCI by default and retains the
 skip macro only as an explicit experimental ablation.
 
-The next highest-value correctness experiment is an adversarial epoch-wrap
-test, followed by a wider generic EP/topology bound if production targets need
-it. Exact per-source cycle attribution would sharpen the mechanism diagnosis,
-but the current Source product exposes visits rather than cycles. Neither the
-compile-time guard nor dispatch policy should be widened until the epoch and
-visibility boundaries are resolved.
+The next highest-value correctness experiment is a wider generic EP/topology
+bound if production targets need it. Exact per-source cycle attribution would
+sharpen the mechanism diagnosis, but the current Source product exposes visits
+rather than cycles. Neither the compile-time guard nor dispatch policy should
+be widened until the visibility boundary and the narrowly missed tiny-wave
+target are resolved.
