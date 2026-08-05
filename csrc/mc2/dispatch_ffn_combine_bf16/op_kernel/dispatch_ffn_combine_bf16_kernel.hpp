@@ -887,6 +887,7 @@ private:
         }
         AscendC::SyncAll<true>();
 
+#ifndef DISPATCH_FFN_COMBINE_DIRECT_INGRESS_SKIP_DCCI
         // The payload arrives through peer writes, while GMM1 subsequently
         // consumes the local window through the Cube cache hierarchy. A rank
         // barrier proves publication ordering but does not itself evict data
@@ -912,6 +913,7 @@ private:
                 shmem() + peermemInfo.offsetDirectA + byteOffset));
         }
         AscendC::SyncAll<true>();
+#endif
     }
 #endif
 
