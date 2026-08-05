@@ -1,7 +1,7 @@
 # Dispatch-FFN-Combine sparse-dataflow roadmap
 
-Status: active experimental implementation. Phase 0 and the first bounded
-Phase 1 barrier-scope change are complete; see
+Status: active experimental implementation. Phase 0 and the bounded Phase 1
+sparse-schedule changes are complete; see
 `dispatch-ffn-combine-phase0-measurements.md`.
 
 ## Objective
@@ -270,15 +270,23 @@ source-derived hypothesis.
 
 ### Phase 1: compact active-expert execution
 
-Status: in progress. Empty source fragments no longer enter the copy helper,
-empty local experts no longer execute a vacuous all-AIV barrier, and GMM1,
-GMM2, and combine skip zero-shape tensor/scheduler setup. AIV-to-AIC progress
-flags are now compacted to scheduled nonempty experts. The loops still scan
-expert indices rather than consuming a materialized worklist, so the value of
-that final compaction step remains to be measured.
+Status: complete at the evidence-supported boundary. Empty source fragments
+no longer enter the copy helper, empty local experts no longer execute a
+vacuous all-AIV barrier, and GMM1, GMM2, and combine skip zero-shape
+tensor/scheduler setup. AIV-to-AIC progress flags are compacted to scheduled
+nonempty experts.
+
+The loops deliberately still scan expert indices. A bracketed 100-sample
+discrimination reduced `experts_per_rank` from 64 to 8, which removes 56 scan
+steps and also shrinks count metadata, but produced no sparse-path latency
+improvement. A shared worklist would add construction, global reads, and
+activation-split synchronization risk without a measured benefit. Revisit it
+only if production evidence exposes a materially larger expert-cardinality
+floor.
 
 - Retain the existing metadata/count exchange and memory ownership.
-- Materialize a compact active-expert worklist.
+- Materialize a compact active-expert worklist only if a future cardinality
+  experiment demonstrates a scan-bound regime.
 - Make GMM1, activation, GMM2, and combine skip empty experts and avoid flag
   advancement for them.
 - Preserve the current rank-wide completion protocol initially.
