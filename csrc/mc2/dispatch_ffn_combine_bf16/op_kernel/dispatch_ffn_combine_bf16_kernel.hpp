@@ -50,6 +50,11 @@ constexpr uint16_t CROSS_CORE_FLAG_MAX_SET_COUNT = 15;
 constexpr uint32_t INGRESS_READY_MAGIC = 0x4D000000U;
 constexpr uint32_t INGRESS_READY_MAGIC_MASK = 0xFF000000U;
 
+#if defined(DISPATCH_FFN_COMBINE_DIRECT_INGRESS_SPARSE_FALLBACK) && \
+    !defined(DISPATCH_FFN_COMBINE_DIRECT_INGRESS)
+#error "direct-ingress sparse fallback requires direct ingress"
+#endif
+
 template <
     class BlockMmad_,
     class BlockScheduler_,
@@ -383,13 +388,39 @@ private:
     CATLASS_DEVICE
     void ApplyXActiveMask(Params const &params)
     {
+        int32_t m = params.problemShape.m();
+        int32_t topK = params.topK;
+        int32_t expertNum = params.expertPerRank * params.EP;
+#ifdef DISPATCH_FFN_COMBINE_DIRECT_INGRESS_SPARSE_FALLBACK
+        // The first padding lane travels with the already exchanged source
+        // count row. Publish an O(1) local preference there so every rank can
+        // make the same protocol choice after the exchange. A supplied MC2
+        // mask is prefix-valid in the production uniform-token path; probing
+        // lane one distinguishes the measured 0/1-token floor without a new
+        // mask or count-matrix scan. A non-prefix mask remains protocol-safe,
+        // but the lane-one test is only a performance heuristic in that case.
+        if (coreIdx == 0 && params.ptrXActiveMask != nullptr) {
+            int32_t preferDirect = peermemInfo.directIngressEnabled ? 1 : 0;
+            if (m <= 1 || !gm_load(
+                    reinterpret_cast<__gm__ bool *>(params.ptrXActiveMask) + 1)) {
+                preferDirect = 0;
+            }
+            const int64_t preferenceOffset =
+                tokenPerExpertLayout(params.rank, 0, expertNum);
+            tokenPerExpert.SetValue(preferenceOffset, preferDirect);
+            // The tagged exchange reads the row through MTE2 and peers receive
+            // it through MTE3. Publish the scalar cache-line update before the
+            // existing all-core mask barrier releases the exchange.
+            DataCacheCleanAndInvalid<
+                int32_t, CacheLine::SINGLE_CACHE_LINE,
+                DcciDst::CACHELINE_OUT>(tokenPerExpert[preferenceOffset]);
+        }
+#endif
+
         if (params.ptrXActiveMask == nullptr) {
             return;
         }
 
-        int32_t m = params.problemShape.m();
-        int32_t topK = params.topK;
-        int32_t expertNum = params.expertPerRank * params.EP;
         int32_t totalElements = m * topK;
         int32_t base = totalElements / coreNum;
         int32_t rem = totalElements % coreNum;
@@ -421,6 +452,26 @@ private:
         }
         AscendC::SyncAll<true>();
     }
+
+#ifdef DISPATCH_FFN_COMBINE_DIRECT_INGRESS_SPARSE_FALLBACK
+    CATLASS_DEVICE
+    void SelectDirectIngressFromPublishedPreferences(Params const &params)
+    {
+        if (!peermemInfo.directIngressEnabled ||
+            params.ptrXActiveMask == nullptr) {
+            return;
+        }
+
+        const int32_t preferenceLane = params.EP * params.expertPerRank;
+        for (int32_t srcRank = 0; srcRank < params.EP; ++srcRank) {
+            if (tokenPerExpert(tokenPerExpertLayout(
+                    srcRank, 0, preferenceLane)) == 0) {
+                peermemInfo.directIngressEnabled = false;
+                return;
+            }
+        }
+    }
+#endif
 
     CATLASS_DEVICE
     void GMM1(Params const &params){
@@ -984,6 +1035,9 @@ private:
 
         AscendC::SyncAll<true>();
         TaggedTokenPerExpertGatherAndGetSumPreRank(params, localTokenPerExpertOffset);
+#ifdef DISPATCH_FFN_COMBINE_DIRECT_INGRESS_SPARSE_FALLBACK
+        SelectDirectIngressFromPublishedPreferences(params);
+#endif
 
         if (coreIdx == 0) {
             GetCumsumForMMAIV(tokenPerExpert, cumsumMM, params.expertPerRank, params.rank, params.EP);
