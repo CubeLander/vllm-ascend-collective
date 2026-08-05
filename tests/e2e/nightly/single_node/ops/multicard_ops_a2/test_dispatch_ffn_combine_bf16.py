@@ -184,6 +184,43 @@ def _run_rank(rank: int, world_size: int, port: int) -> None:
 
         torch.testing.assert_close(out[:active_tokens].cpu(), expected[:active_tokens], rtol=0.02, atol=0.02)
         torch.testing.assert_close(expert_token_nums.cpu(), expected_masked_counts)
+
+        # Exercise the one-tensor-per-expert ABI as well as the packed tensor
+        # above. Sparse schedules are especially important here: an empty
+        # expert must skip its GEMM without shifting the weight-list index used
+        # by the next active expert.
+        weight1_list_nz = [
+            torch_npu.npu_format_cast(weight1[local_expert].npu(), 29)
+            for local_expert in range(local_experts)
+        ]
+        weight2_list_nz = [
+            torch_npu.npu_format_cast(weight2[local_expert].npu(), 29)
+            for local_expert in range(local_experts)
+        ]
+        empty_scales = [torch.empty(0, dtype=torch.int64) for _ in range(local_experts)]
+
+        out.fill_(torch.nan)
+        expert_token_nums.fill_(-1)
+        torch.ops._C_ascend.dispatch_ffn_combine(
+            x=x,
+            weight1=weight1_list_nz,
+            weight2=weight2_list_nz,
+            expert_idx=masked_expert_idx,
+            scale1=empty_scales,
+            scale2=empty_scales,
+            bias1=empty_bias,
+            bias2=empty_bias,
+            probs=probs,
+            group=_get_hcomm_name(rank),
+            max_output_size=512,
+            x_active_mask=x_active_mask.npu(),
+            out=out,
+            expert_token_nums=expert_token_nums,
+        )
+        torch_npu.npu.synchronize()
+
+        torch.testing.assert_close(out[:active_tokens].cpu(), expected[:active_tokens], rtol=0.02, atol=0.02)
+        torch.testing.assert_close(expert_token_nums.cpu(), expected_masked_counts)
     finally:
         dist.destroy_process_group()
 
