@@ -120,14 +120,25 @@ graph-padded active sizes `{1, 4, 16}`.
 
 Phase 0's source hypothesis is accepted: empty-expert AIV coordination
 explains a material part of the small-M fixed floor. The bounded barrier skip
-is worth retaining. It is only a partial Phase 1 implementation: AIC still
-iterates all expert slots, progress flags still advance for empty experts, and
-egress retains rank-wide completion.
+is worth retaining.
+
+A second bounded Phase 1 change retained the same progress protocol but made
+GMM1, GMM2, and combine bypass tensor-address construction and zero-shape
+scheduler setup for empty experts. It explicitly preserves activation split
+events and packed-weight offsets. Across two A/B orders against the
+barrier-skip-only binary, the slower-rank median improved by 14.5--19.7% for
+the four-expert decode case and 11.5--14.5% for graph M=64 with one active
+token. Dense cases are controls because they take no new empty-expert branch;
+their variation is environmental noise rather than attributable benefit.
+
+Phase 1 remains partial: the loops still traverse expert indices, progress
+flags still advance for empty experts, and egress retains rank-wide
+completion.
 
 ## Next decision
 
-The next experiment should compact the AIC/AIV expert schedule while retaining
-the current transport and return layout. It must demonstrate that removing
-empty-expert flag advancement and AIC scheduler iterations saves more than
-the worklist construction costs. Transport redesign remains gated on
+The next experiment should compact the shared AIC/AIV expert schedule while
+retaining the current transport and return layout. It must demonstrate that
+removing empty-expert flag advancement and the remaining index traversal saves
+more than worklist construction costs. Transport redesign remains gated on
 production distributions of `R/U` and nonempty source-expert fragments.

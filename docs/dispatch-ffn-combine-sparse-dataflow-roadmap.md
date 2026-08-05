@@ -271,9 +271,10 @@ source-derived hypothesis.
 ### Phase 1: compact active-expert execution
 
 Status: in progress. Empty source fragments no longer enter the copy helper,
-and empty local experts no longer execute a vacuous all-AIV barrier. AIC still
-iterates all expert slots and the AIV-to-AIC flag count is unchanged, so a
-true compact worklist remains to be implemented and measured.
+empty local experts no longer execute a vacuous all-AIV barrier, and GMM1,
+GMM2, and combine skip zero-shape tensor/scheduler setup. The loops still
+traverse expert indices and the AIV-to-AIC flag count is unchanged, so a true
+compact worklist remains to be implemented and measured.
 
 - Retain the existing metadata/count exchange and memory ownership.
 - Materialize a compact active-expert worklist.
