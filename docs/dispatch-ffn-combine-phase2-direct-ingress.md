@@ -147,10 +147,31 @@ default because:
 2. the graph `active=1` crossover needs a zero-scan policy input;
 3. the source-owned epoch assumes a fresh common initial generation and a
    bounded one-wave skew; wrap and communicator reuse need adversarial tests;
-4. DCCI should be ablated now that the phase-alias defect is understood; and
+4. the DCCI ablation passes the current test but is not yet strong enough to
+   replace the conservative visibility boundary; and
 5. the dense count exchange remains, even though per-expert receiver pulls and
    their barriers are gone.
 
+### DCCI ablation
+
+The received-row DCCI loop can be removed in a disposable build with
+`DISPATCH_FFN_COMBINE_DIRECT_INGRESS_SKIP_DCCI`. That build passed the complete
+two-rank repeated-generation test. A 100-sample run was bracketed by two builds
+with DCCI:
+
+| Case | DCCI before | No DCCI | DCCI after | Judgment |
+|---|---:|---:|---:|---|
+| decode M=8, spread | 428.57 us | 410.65 us | 441.16 us | 4.2--6.9% faster |
+| prefill M=256, spread | 532.41 us | 526.40 us | 547.83 us | 1.1--3.9% faster |
+| graph M=64, active=1 | 340.28 us | 352.15 us | 353.67 us | inconclusive |
+
+Removing DCCI is directionally useful for the larger route families but does
+not explain the smallest-wave floor. More importantly, repeated correctness is
+not a substitute for a documented peer-write-to-Cube visibility contract. The
+conservative direct prototype therefore keeps DCCI by default and retains the
+skip macro only as an explicit experimental ablation.
+
 The next highest-value experiment is source-attributed msopprof on a disposable
-debug build, followed by a DCCI ablation and a generic-EP correctness run. Only
-then should the prototype's compile-time guard or dispatch policy be widened.
+debug build, followed by a generic-EP correctness run and a stronger
+generation/visibility stress test. Only then should the prototype's
+compile-time guard or dispatch policy be widened.
