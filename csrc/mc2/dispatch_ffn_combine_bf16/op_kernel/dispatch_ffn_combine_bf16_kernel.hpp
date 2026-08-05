@@ -440,6 +440,22 @@ private:
             } else if (preCurrentmSum + currentM >= params.maxOutputSize) {
                 currentM = params.maxOutputSize - preCurrentmSum;
             }
+            if (currentM == 0) {
+                // Preserve the activation split and packed-weight position,
+                // but do not construct a zero-shape GEMM schedule.
+                if ((groupIdx + 1) == params.epilogueGranularity &&
+                    groupIdx < params.expertPerRank - 1) {
+                    syncLoopIdx++;
+                    if constexpr (BlockMmad::DispatchPolicy::ASYNC) {
+                        blockMmad.SynchronizeBlock();
+                    }
+                    blockMmad.Finalize(syncLoopIdx, SYNCFLAGC2V);
+                }
+                if (params.listLen == 1) {
+                    gmGroupOffsetB += params.problemShape.k() * params.problemShape.n();
+                }
+                continue;
+            }
             AscendC::GlobalTensor<ElementB> gmB1;
             AscendC::GlobalTensor<ElementScale> gmS;
             int32_t arrayGroupIdx = params.listLen == 1 ? 0 : groupIdx;
@@ -555,6 +571,18 @@ private:
                 currentM = 0;
             } else if (preCurrentmSum + currentM > params.maxOutputSize) {
                 currentM = params.maxOutputSize - preCurrentmSum;
+            }
+            if (currentM == 0) {
+                // Preserve the activation split and packed-weight position,
+                // but do not construct a zero-shape GEMM schedule.
+                if (params.expertPerRank > lastDequantExpertNum &&
+                    groupIdx + 1 == params.expertPerRank - lastDequantExpertNum) {
+                    AscendC::CrossCoreWaitFlag<0x2>(SYNCFLAGV2C);
+                }
+                if (params.listLen == 1) {
+                    gmGroupOffsetB += k2 * n2;
+                }
+                continue;
             }
             AscendC::GlobalTensor<ElementB> gmB2;
             AscendC::GlobalTensor<ElementScale> gmS2;
@@ -1024,6 +1052,9 @@ private:
                 currentExpertM = 0;
             } else if (preSrcExpertSum + currentExpertM > params.maxOutputSize) {
                 currentExpertM = params.maxOutputSize - preSrcExpertSum;
+            }
+            if (currentExpertM == 0) {
+                continue;
             }
             GemmCoord inGroupProblemShape{currentExpertM, n2, k2}; // M N K
             blockScheduler.Update(inGroupProblemShape, MakeCoord(L1TileShape::M, L1TileShape::N));
