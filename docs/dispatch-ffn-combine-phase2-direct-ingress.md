@@ -125,6 +125,43 @@ rejected rather than committed. A production selector must reuse a cheaply
 available cardinality or compute it during routing; it must not add a new dense
 scan.
 
+### Zero-scan sparse fallback candidate
+
+`DISPATCH_FFN_COMBINE_DIRECT_INGRESS_SPARSE_FALLBACK` is a compile-time
+candidate for the remaining `active=1` crossover. It is deliberately coupled
+to `DISPATCH_FFN_COMBINE_DIRECT_INGRESS` and leaves the default build
+unchanged.
+
+The production uniform-token wrapper supplies a prefix-valid `mc2_mask`.
+Consequently, `mask[1]` exactly separates zero or one active token from two or
+more whenever the graph capacity is greater than one. A source publishes that
+local direct-ingress preference in the first padding lane after its real
+expert counts. The existing tagged count-row exchange carries the lane to
+every peer, so the selector adds no communication round and reads only one
+integer per source, O(EP), rather than scanning the O(EP^2 * experts-per-rank)
+count matrix. Every rank enables direct ingress only when every source's
+preference is nonzero; this all-source AND prevents ranks from choosing
+different protocols even if a lower-level caller supplies differing masks.
+
+The buffer layout is chosen before this dynamic decision. When the selector
+falls back, the original pull loop writes into the already selected direct
+input buffer, while AIC and egress retain the matching direct-buffer offsets.
+The selector therefore changes only how input rows arrive, not their final
+layout or the AIC/AIV address contract.
+
+The candidate has passed a forced Ascend 910B package compile for all four
+registered dtype/format variants. The validation also checked the generated
+per-op compiler driver: an earlier incremental build had retained a stale
+`SKIP_DCCI` option despite regenerating the dynamic driver, so its unchanged
+objects were rejected. After refreshing that driver and all four generation
+stamps, selector objects grew from 605,560 to 609,656 bytes and received new
+hashes. Hardware correctness and crossover timing remain pending: newly
+created development containers currently fail DCMI initialization and report
+zero visible NPUs despite idle physical devices. The first recovery experiment
+should bracket the selector build against direct ingress on EP2 for graph
+`active=1` and `active=16`, then run the existing 2,048-generation route stress
+before widening to EP4.
+
 ## msopprof evidence
 
 MC2 cannot be safely replayed as an isolated kernel or range: the peer must
@@ -170,7 +207,8 @@ a strong first performance signal. It is not ready to become the production
 default because:
 
 1. generic EP and larger expert topology bounds are not yet validated;
-2. the graph `active=1` crossover needs a zero-scan policy input;
+2. the graph `active=1` crossover has a zero-scan candidate, but still needs
+   hardware correctness and bracketed timing evidence;
 3. the source-owned epoch assumes a fresh common initial generation and a
    bounded one-wave skew; 2,048-generation communicator reuse passes, but
    signed wrap still needs an adversarial test;
@@ -198,9 +236,9 @@ not a substitute for a documented peer-write-to-Cube visibility contract. The
 conservative direct prototype therefore keeps DCCI by default and retains the
 skip macro only as an explicit experimental ablation.
 
-The next highest-value experiment is a generic-EP correctness run, followed by
-a zero-scan crossover input for the one-active-token graph case. Exact
-per-source cycle attribution would sharpen the mechanism diagnosis, but the
-current Source product exposes visits rather than cycles and should not block
-the generic-topology gate. Only after those gates should the prototype's
+The next highest-value experiment is EP2 hardware validation of the zero-scan
+crossover candidate, followed by a generic-EP correctness run. Exact per-source
+cycle attribution would sharpen the mechanism diagnosis, but the current
+Source product exposes visits rather than cycles and should not block the
+generic-topology gate. Only after those gates should the prototype's
 compile-time guard or dispatch policy be widened.
