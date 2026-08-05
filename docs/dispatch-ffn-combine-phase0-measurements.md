@@ -131,14 +131,40 @@ the four-expert decode case and 11.5--14.5% for graph M=64 with one active
 token. Dense cases are controls because they take no new empty-expert branch;
 their variation is environmental noise rather than attributable benefit.
 
-Phase 1 remains partial: the loops still traverse expert indices, progress
-flags still advance for empty experts, and egress retains rank-wide
-completion.
+At that checkpoint, Phase 1 still traversed every expert index and advanced
+progress flags for empty experts.
+
+A third bounded change compacted the AIV-to-AIC ingress progress sequence
+without changing payload placement. AIV now publishes a progress flag only
+for an expert with scheduled rows after `max_output_size` clipping. Every AIC
+core consumes exactly one flag per such expert, in the same expert order. The
+initial count-ready flag is unchanged. This removes empty-expert flag traffic
+while keeping a one-to-one producer/consumer sequence and avoiding a new
+workspace data structure.
+
+Two 100-sample AIC-skip/compact-signal comparisons bracketed the compact run
+with the prior binary. Using the slower rank's median host latency:
+
+| Case | Prior binary before compact | Prior binary after compact | Judgment |
+|---|---:|---:|---|
+| eight-token, four experts total | -15.7% | -23.5% | stable compact-signal win |
+| graph M=64, one active token | -15.8% | -23.6% | stable compact-signal win |
+| dense 64-token spread | -0.6% | -7.0% | control; no attributable regression |
+| dense 256-token spread | -0.5% | -7.3% | control; no attributable regression |
+
+The dense cases publish the same 64 expert signals before and after the
+change, so their run-to-run variation cannot be credited to compaction. The
+sparse improvement is directionally stable and has the expected dependence
+on removed signal count. The full 13-case matrix also completed 30 repeated
+invocations per case with numerical and expert-count checks.
+
+Phase 1 remains partial: the loops still scan expert indices to discover the
+compact sequence, and egress retains rank-wide completion.
 
 ## Next decision
 
-The next experiment should compact the shared AIC/AIV expert schedule while
-retaining the current transport and return layout. It must demonstrate that
-removing empty-expert flag advancement and the remaining index traversal saves
-more than worklist construction costs. Transport redesign remains gated on
-production distributions of `R/U` and nonempty source-expert fragments.
+The next experiment should decide whether materializing a shared active-expert
+worklist saves more than its construction cost relative to the now-compact
+signal scan. Transport redesign remains gated on production distributions of
+`R/U` and nonempty source-expert fragments. Egress completion can be studied
+independently because direct return placement is already present.

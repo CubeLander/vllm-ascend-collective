@@ -425,7 +425,6 @@ private:
         int64_t gmGroupOffsetB = 0;
         int64_t gmGroupOffsetC = 0;
         uint32_t startCoreIdx = 0;
-        uint32_t syncGroupIdx = 0;
         int64_t preCurrentmSum = 0;
         int32_t syncLoopIdx = -1;
 
@@ -456,6 +455,11 @@ private:
                 }
                 continue;
             }
+            // Empty experts have no producer signal. Every AIC core consumes
+            // one compact progress signal for each scheduled expert, in the
+            // same order in which AIV publishes them.
+            AscendC::CrossCoreWaitFlag<0x2>(syncgmmIdx / CROSS_CORE_FLAG_MAX_SET_COUNT);
+            syncgmmIdx++;
             AscendC::GlobalTensor<ElementB> gmB1;
             AscendC::GlobalTensor<ElementScale> gmS;
             int32_t arrayGroupIdx = params.listLen == 1 ? 0 : groupIdx;
@@ -476,10 +480,6 @@ private:
             // Loop through the matmul of each groupIdx
 
             for (uint32_t loopIdx = startLoopIdx; loopIdx < coreLoops; loopIdx += coreNum) {
-                for(;syncGroupIdx <= groupIdx; syncGroupIdx++) {
-                    AscendC::CrossCoreWaitFlag<0x2>(syncgmmIdx / CROSS_CORE_FLAG_MAX_SET_COUNT);
-                    syncgmmIdx ++;
-                }
                 // Compute block location
                 GemmCoord blockCoord = blockScheduler.GetBlockCoord(loopIdx);
                 GemmCoord actualBlockShape = blockScheduler.GetActualBlockShape(blockCoord);
@@ -527,11 +527,6 @@ private:
             }
             gmGroupOffsetC += inGroupProblemShape.m() * inGroupProblemShape.n();
             startCoreIdx = (startCoreIdx  + coreLoops) % coreNum;
-        }
-
-        for(;syncGroupIdx < params.expertPerRank; syncGroupIdx++) {
-            AscendC::CrossCoreWaitFlag<0x2>(syncgmmIdx / CROSS_CORE_FLAG_MAX_SET_COUNT);
-            syncgmmIdx ++;
         }
 
         if constexpr (BlockMmad::DispatchPolicy::ASYNC) {
@@ -883,6 +878,12 @@ private:
         for (int32_t groupIdx = 0; groupIdx < params.expertPerRank; ++groupIdx) {
             // The ith core reads data from the ith rank's peermem
             uint32_t currentM = cumsumMM((params.EP - 1) * params.expertPerRank + groupIdx);
+            uint32_t scheduledM = currentM;
+            if (prevGroupSum1 >= params.maxOutputSize) {
+                scheduledM = 0;
+            } else if (prevGroupSum1 + scheduledM >= params.maxOutputSize) {
+                scheduledM = params.maxOutputSize - prevGroupSum1;
+            }
             for(int32_t dstEpIdx = coreIdx; dstEpIdx < params.EP; dstEpIdx += coreNum) {
                 uint32_t rowStart = (dstEpIdx == 0 ? 0 : cumsumMM((dstEpIdx - 1) * params.expertPerRank + groupIdx)) + prevGroupSum1;
                 if (rowStart < params.maxOutputSize) {
@@ -908,15 +909,16 @@ private:
                 }
             }
             // The route counts are shared by every AIV core, so this branch is
-            // uniform.  An empty expert has no ingress writes to make visible;
-            // retain the AIV->AIC progress signal, but avoid a vacuous global
-            // barrier.  The next non-empty expert still synchronizes all of its
-            // producers before publishing readiness.
-            if (currentM > 0) {
+            // uniform. An unscheduled expert has neither ingress writes nor an
+            // AIC consumer: omit both its barrier and progress signal. The next
+            // scheduled expert still synchronizes all producers before
+            // publishing readiness.
+            if (scheduledM > 0) {
                 AscendC::SyncAll<true>();
+                AscendC::CrossCoreSetFlag<0x2, PIPE_MTE3>(
+                    syncgmm1Idx / CROSS_CORE_FLAG_MAX_SET_COUNT);
+                syncgmm1Idx++;
             }
-            AscendC::CrossCoreSetFlag<0x2, PIPE_MTE3>(syncgmm1Idx / CROSS_CORE_FLAG_MAX_SET_COUNT);
-            syncgmm1Idx ++;
 
             prevGroupSum1 += currentM;
 
