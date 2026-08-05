@@ -110,8 +110,14 @@ objects, and the tracked EP2+EP4 regressions passed again. A disposable kernel
 seeded the ingress epoch at `UINT32_MAX - 2`; 14 changing EP2 generations
 crossed wrap and passed exact output and expert-count checks. The seed hook was
 not retained. These results close the current EP4, 256-expert, and modular
-epoch-wrap correctness gates; topologies beyond EP4/256 experts remain
-untested.
+epoch-wrap correctness gates.
+
+Finally, the repeated-wave harness passed both a 56-generation pilot and 2,048
+generations at EP8, using all eight devices, 16 local experts per rank, and a
+2,048-row one-destination capacity. The long run rotated the hot destination
+across every rank. Current single-node evidence therefore covers EP2, EP4, and
+EP8; 256 global experts at EP4; 128 global experts at EP8; and modular epoch
+wrap. Multi-node EP and topologies above 256 global experts remain untested.
 
 ## First performance discrimination
 
@@ -226,8 +232,8 @@ The direct-placement mechanism passes the Phase 2 EP2 and EP4 correctness
 gates and has a strong first performance signal. It is not ready to become the
 production default because:
 
-1. EP4 with 256 global experts is validated, but wider generic EP/topology
-   bounds are not;
+1. single-node EP8 and EP4 with 256 global experts are validated, but
+   multi-node EP and topologies above 256 global experts are not;
 2. the graph `active=1` selector is consistently faster, but its 4.34% median
    gain narrowly misses the preregistered 5% useful-effect target;
 3. the source-owned epoch assumes a fresh common initial generation and a
@@ -257,9 +263,9 @@ not a substitute for a documented peer-write-to-Cube visibility contract. The
 conservative direct prototype therefore keeps DCCI by default and retains the
 skip macro only as an explicit experimental ablation.
 
-The next highest-value correctness experiment is a wider generic EP/topology
-bound if production targets need it. Exact per-source cycle attribution would
-sharpen the mechanism diagnosis, but the current Source product exposes visits
-rather than cycles. Neither the compile-time guard nor dispatch policy should
-be widened until the visibility boundary and the narrowly missed tiny-wave
-target are resolved.
+The next highest-value work is resolving the peer-write-to-Cube visibility
+boundary from an authoritative contract; repeated success alone is not enough
+to remove DCCI. Exact per-source cycle attribution would sharpen the mechanism
+diagnosis, but the current Source product exposes visits rather than cycles.
+Neither the compile-time guard nor dispatch policy should be widened until the
+visibility boundary and the narrowly missed tiny-wave target are resolved.

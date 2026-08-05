@@ -39,7 +39,7 @@ rather than scanning the dense count matrix. All four registered Ascend 910B
 dtype/format variants compile with the selector. EP2 hardware exactness,
 bracketed crossover timing, EP4 exactness, and repeated reuse are now evidence;
 unsigned epoch wrap is also hardware-validated. Wider production topologies
-remain open.
+up to single-node EP8 are now covered.
 
 ## Code and evidence map
 
@@ -184,7 +184,10 @@ reintroduce a serialized O(EP² × local-experts) scan or a new selection round.
 - A byte-identical unsigned-counter rebuild passed tracked EP2+EP4 again. A
   disposable ingress seed at `UINT32_MAX - 2` crossed wrap during 14 changing
   EP2 generations with exact output and expert counts; the hook was removed.
-- Topologies beyond EP4/256 global experts remain open.
+- A 56-generation pilot and 2,048-generation run passed on EP8 with exact
+  output/counts, all eight devices, and the one-destination hotspot rotated
+  across every rank. Multi-node EP and topologies above 256 experts remain
+  open.
 
 ### Bracketed critical-path timing
 
@@ -348,7 +351,7 @@ Use this order so a failure has a small search space:
 6. Restore the release package, stop/remove only this task's container, and
    confirm the physical devices returned to their prior idle state.
 
-Promotion gates remain: wider generic EP/topology bounds if required, the
+Promotion gates remain: multi-node or above-256-expert bounds if required, the
 narrowly missed 5% tiny-wave target, and a conservative visibility boundary.
 The dense count exchange is still present and can be revisited later, but
 removing it is not part of the current closed optimization line.
