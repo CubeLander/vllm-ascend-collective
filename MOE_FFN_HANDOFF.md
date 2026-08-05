@@ -6,13 +6,14 @@ Repository: `CubeLander/vllm-ascend-hust`
 
 Published handoff branch: `agent/moe-ffn-handoff-20260805`
 
-Source branch: `agent/moe-gmm2-cutthrough`
+Active continuation branch: `agent/moe-gmm2-cutthrough-revival`
 
-Source head before this handoff: `5cd9c9fe4096c0796290df7ec9c9f913a26b2a2f`
+Latest kernel checkpoint: `161ca3bd2` (not yet published)
 
 Status: experimental and compile-time guarded. The production default is
 unchanged. Hardware revival on a healthy Ascend 910B host has now validated the
-zero-scan sparse fallback on EP2 and widened repeated exactness to EP4.
+zero-scan sparse fallback through EP8, explicit payload ordering, and 512
+global experts on one node.
 
 ## State in one page
 
@@ -45,7 +46,7 @@ up to single-node EP8 are now covered.
 
 | Area | Location | Meaning |
 |---|---|---|
-| Kernel and compile guards | `csrc/mc2/dispatch_ffn_combine_bf16/op_kernel/dispatch_ffn_combine_bf16_kernel.hpp` | Direct placement, epochs, cache maintenance, fallback selector |
+| Kernel and compile guards | `csrc/mc2/dispatch_ffn_combine_bf16/op_kernel/dispatch_ffn_combine_bf16_kernel.hpp` | Direct placement, epochs, memory ordering, fallback selector |
 | Protocol and experimental receipts | `docs/dispatch-ffn-combine-phase2-direct-ingress.md` | Authoritative design, correctness, timing, msopprof, and remaining gates |
 | Tracked EP2/EP4 regression | `tests/e2e/nightly/single_node/ops/multicard_ops_a2/test_dispatch_ffn_combine_bf16.py` | Dense and changing routes, graph padding, sparse tensor-list weights |
 | Production mask construction | `vllm_ascend/ascend_forward_context.py` | Builds a true-prefix/false-suffix `mc2_mask` |
@@ -91,6 +92,10 @@ Read these in chronological order when recovering intent:
 | `c16592cc8` | Normalize bare image IDs in the source-container helper |
 | `3e5cd5b0e` | Record 2,048-generation stress and source attribution |
 | `5cd9c9fe4` | Add the zero-scan sparse fallback selector |
+| `8a7adf477` | Add tracked EP4 direct-ingress validation |
+| `3ecb4e684` | Make MC2 epoch arithmetic explicitly wrap-safe |
+| `592187815` | Record repeated EP8 direct-ingress validation |
+| `161ca3bd2` | Replace payload DCCI with explicit memory barriers |
 
 ## Protocol and invariants
 
