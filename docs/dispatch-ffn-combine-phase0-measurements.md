@@ -158,13 +158,41 @@ sparse improvement is directionally stable and has the expected dependence
 on removed signal count. The full 13-case matrix also completed 30 repeated
 invocations per case with numerical and expert-count checks.
 
-Phase 1 remains partial: the loops still scan expert indices to discover the
-compact sequence, and egress retains rank-wide completion.
+The end-to-end regression now also exercises the one-tensor-per-expert weight
+ABI with a graph-padded one-token route. The live routes target experts 56--63
+on one rank while the other rank receives no work, covering both a completely
+empty schedule and preservation of late tensor-list indices across long empty
+runs.
+
+### Active-worklist discrimination
+
+Before adding a shared active-expert worklist, a bounded discrimination varied
+`experts_per_rank` from 64 to 8 while retaining EP=2, the same dimensions, and
+the same sparse route families. This is not a pure worklist A/B because it also
+shrinks count metadata, but it gives the 8-expert case every expected advantage
+if the remaining 64-index scans are material. Two 64-expert runs bracketed one
+8-expert run, each with 100 samples. Slower-rank host medians were:
+
+| Case | 64 experts, before | 8 experts | 64 experts, after | 8-expert judgment |
+|---|---:|---:|---:|---|
+| eight-token, four experts total | 446.0 us | 461.7 us | 421.6 us | 3.5--9.5% slower |
+| graph M=64, one active token | 430.7 us | 460.2 us | 448.5 us | 2.6--6.9% slower |
+
+Device-event medians gave the same non-improving direction. Absolute launch
+timings drift, so this is not evidence that a larger expert table is faster.
+It is evidence that removing 56 scan iterations does not expose a measurable
+win in the current kernel. Materializing and globally reading a worklist would
+also add construction, storage, and activation-split protocol complexity.
+
+Phase 1's proven part is therefore complete without a materialized worklist:
+empty experts no longer perform ingress barriers, progress publications, or
+zero-shape schedules. The remaining index scans are intentionally retained.
+Egress still retains rank-wide completion.
 
 ## Next decision
 
-The next experiment should decide whether materializing a shared active-expert
-worklist saves more than its construction cost relative to the now-compact
-signal scan. Transport redesign remains gated on production distributions of
-`R/U` and nonempty source-expert fragments. Egress completion can be studied
-independently because direct return placement is already present.
+Do not materialize a shared active-expert worklist without stronger evidence;
+the slot-count discrimination found no remaining scan benefit. Transport
+redesign remains gated on production distributions of `R/U` and nonempty
+source-expert fragments. Egress completion can be studied independently
+because direct return placement is already present.
