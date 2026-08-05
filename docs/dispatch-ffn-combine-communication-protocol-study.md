@@ -1,7 +1,8 @@
 # Dispatch-FFN-Combine communication protocol study
 
-Status: prior-art and local-source study; no operator implementation is
-authorized by this note.
+Status: prior-art and local-source study, followed by an experimental
+compile-time direct-ingress prototype. See
+`dispatch-ffn-combine-phase2-direct-ingress.md` for implementation evidence.
 
 Snapshot: 2026-08-05. The external source trees inspected for this study were
 DeepEP commit `01dc3aaac82068020353dce2c302e38153c0bfaa` and NCCL commit
@@ -240,9 +241,25 @@ supports a decode/prefill split or an adaptive choice:
    bounded outstanding-generation assumption, or alternating buffers must
    prove that reuse cannot race a previous consumer.
 
-## Smallest next experiment
+## Prototype resolution
 
-Before changing transport, add removable phase and cardinality counters for:
+The first implementation did not need a second receiver-reservation round.
+The existing complete count matrix lets every source compute the same final
+expert-major destination prefixes, so sources can push disjoint fragments
+directly and publish one source-owned sealed-wave epoch. This removes
+receiver-side per-expert pulls and their barriers while keeping the streaming
+direct-return path unchanged.
+
+The EP2 prototype passes repeated changing-generation correctness and improves
+six of seven bracketed route families. The exception is the smallest
+graph-padded route family, where an extra wave epoch is not amortized. Thus the
+study's adaptive-policy judgment is retained, but the direct-placement family
+now has positive local evidence rather than remaining only a hypothesis.
+
+## Next experiment
+
+For the remaining policy and hardening questions, retain removable phase and
+cardinality counters for:
 
 - route count `R` and unique token-destination count `U`;
 - active local experts and nonempty `(source, local expert)` fragments;

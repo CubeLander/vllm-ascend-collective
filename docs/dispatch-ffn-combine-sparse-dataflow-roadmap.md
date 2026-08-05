@@ -1,8 +1,10 @@
 # Dispatch-FFN-Combine sparse-dataflow roadmap
 
 Status: active experimental implementation. Phase 0 and the bounded Phase 1
-sparse-schedule changes are complete; see
-`dispatch-ffn-combine-phase0-measurements.md`.
+sparse-schedule changes are complete. The compile-time Phase 2 sealed-wave
+direct-ingress prototype passes EP2 correctness and improves six of seven
+bracketed route families; see `dispatch-ffn-combine-phase0-measurements.md`
+and `dispatch-ffn-combine-phase2-direct-ingress.md`.
 
 ## Objective
 
@@ -298,6 +300,20 @@ Gate: matched correctness; no deadlock across repeated graph replay; stable
 small-M reduction attributable to active-expert count.
 
 ### Phase 2: discriminate and prototype ingress placement
+
+Status: direct final placement is implemented behind
+`DISPATCH_FFN_COMBINE_DIRECT_INGRESS`. It reuses the existing complete count
+matrix so every source can compute disjoint final destination prefixes without
+a returned reservation round. A dedicated source-owned epoch publishes one
+sealed request wave; the old per-expert receiver-pull copies and ingress
+barriers are bypassed. EP2 repeated-generation correctness passes.
+
+The first bracketed 50-sample result improves six route families by 10.6--23.3%
+on the slower-rank device median. Graph M=64 with one active token is
+inconclusive to negative because the new epoch cannot be amortized. A naive
+runtime route-matrix scan was measured and rejected; it added about 50 us of
+rank skew. The prototype remains compile-time experimental while a cheap
+policy input, generic EP, generation reuse, and DCCI ablation are unresolved.
 
 - Compare the existing source-pull layout, a fixed
   `[expert][source][slot]` direct-write layout, and rank-deduplicated ingress.
