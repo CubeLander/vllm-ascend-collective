@@ -88,6 +88,14 @@ The test includes repeated peer-window reuse, changing nonuniform route
 generations, a rank with zero received experts, late sparse tensor-list routes,
 and graph padding with one active token.
 
+A separate long-reuse harness then held one EP2 communicator and peer window
+open for 2,048 consecutive generations. It varied active-token counts over
+`0, 1, 2, 7, 16, 31, 64` and rotated through all-empty, one-destination,
+local-only, peer-only, and mixed expert routes. Every generation passed exact
+output and expert-count oracles. This closes the ordinary changing-generation
+stress gate on EP2; it does not exercise signed epoch wrap or a larger EP
+topology.
+
 ## First performance discrimination
 
 The Phase 1 compact-signal binary was run before and after the direct binary,
@@ -132,10 +140,28 @@ The Phase 1 operator is control/wait dominated rather than bandwidth bound:
 - Vector utilization was 0.65%, MTE2 4.49%, and MTE3 1.48%; and
 - measured GM/L1/UB bandwidth ratios were all below 0.1%.
 
-This does not identify every wait site because the release objects lack
-`.debug_line`, but it independently supports reducing protocol coordination
-rather than tuning payload bandwidth first. A disposable `-g` build is needed
-for source-level PC attribution.
+This independently supports reducing protocol coordination rather than tuning
+payload bandwidth first.
+
+A disposable debug object built by invoking `opc` directly with
+`--op_debug_level=1 --op_debug_config=dump_loc,ccec_g` supplied the missing
+DWARF line table. Source-mode collection then extracted 36,108 PC/source
+relations and 375,915 address-to-line relations. Joining its `fdata` with the
+basic-block map attributed 650 nonzero blocks and 95,832 control-flow visits
+to source lines, including the direct-ingress prefix, publication, and
+consumer phases.
+
+Two boundaries matter:
+
+- basic-block visit counts are control-flow evidence, not per-line cycles, so
+  they must not be presented as latency-hotspot percentages; and
+- the debug object has a slightly different `.text` section from the release
+  object, so it is suitable for source attribution but not comparative timing.
+
+The normal package-build path did not preserve `ccec_g`: its generated options
+contained two `ALL` rows and the later ordinary option row shadowed the debug
+row. Direct `opc` compilation was therefore required for this disposable
+artifact. The conservative release object was restored after collection.
 
 ## Gate result and next work
 
@@ -146,7 +172,8 @@ default because:
 1. generic EP and larger expert topology bounds are not yet validated;
 2. the graph `active=1` crossover needs a zero-scan policy input;
 3. the source-owned epoch assumes a fresh common initial generation and a
-   bounded one-wave skew; wrap and communicator reuse need adversarial tests;
+   bounded one-wave skew; 2,048-generation communicator reuse passes, but
+   signed wrap still needs an adversarial test;
 4. the DCCI ablation passes the current test but is not yet strong enough to
    replace the conservative visibility boundary; and
 5. the dense count exchange remains, even though per-expert receiver pulls and
@@ -171,7 +198,9 @@ not a substitute for a documented peer-write-to-Cube visibility contract. The
 conservative direct prototype therefore keeps DCCI by default and retains the
 skip macro only as an explicit experimental ablation.
 
-The next highest-value experiment is source-attributed msopprof on a disposable
-debug build, followed by a generic-EP correctness run and a stronger
-generation/visibility stress test. Only then should the prototype's
+The next highest-value experiment is a generic-EP correctness run, followed by
+a zero-scan crossover input for the one-active-token graph case. Exact
+per-source cycle attribution would sharpen the mechanism diagnosis, but the
+current Source product exposes visits rather than cycles and should not block
+the generic-topology gate. Only after those gates should the prototype's
 compile-time guard or dispatch policy be widened.
