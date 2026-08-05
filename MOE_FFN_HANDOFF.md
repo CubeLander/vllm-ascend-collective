@@ -101,10 +101,10 @@ route locally into source-owned staging
   -> publish and gather the existing count matrix
   -> each source derives exact source and destination prefixes
   -> each source pushes nonempty fragments to remote final input
-  -> local producer cores join
-  -> one source-owned ingress epoch publishes the complete source wave
+  -> every producer core completes MTE3 payload writes, then local cores join
+  -> one source-owned ingress epoch publishes and completes the source wave
   -> each destination waits for every source epoch
-  -> invalidate only rows actually received
+  -> order the completed epoch reads before MTE2/Cube consumption
   -> publish compact AIV-to-AIC expert progress
 ```
 
@@ -120,10 +120,11 @@ The following are correctness constraints rather than tuning preferences:
 3. A waiter accepts the requested epoch or one generation ahead, matching the
    existing bounded-skew rule. Epochs are explicit unsigned 32-bit modular
    counters; a disposable `UINT32_MAX - 2` seed crossed wrap with exact output.
-4. Payload cache maintenance is partitioned by hardware cache line so two
-   cores do not issue DCCI for the same line. The conservative DCCI remains the
-   default until a documented peer-write-to-Cube visibility contract or
-   stronger evidence justifies removal.
+4. Every producer core executes a DDR data-sync barrier before the local AIV
+   join. The publisher completes its scalar epoch store, and the receiver
+   executes a DDR data-sync barrier after observing every source epoch. Scalar
+   epoch accesses retain DCCI; the DMA payload does not use scalar cache
+   maintenance.
 5. Buffer layout is chosen before the dynamic selector. On fallback, the
    legacy pull loop writes into the already selected direct input buffer, so
    AIC and egress offsets remain coherent.
@@ -186,8 +187,9 @@ reintroduce a serialized O(EP² × local-experts) scan or a new selection round.
   EP2 generations with exact output and expert counts; the hook was removed.
 - A 56-generation pilot and 2,048-generation run passed on EP8 with exact
   output/counts, all eight devices, and the one-destination hotspot rotated
-  across every rank. Multi-node EP and topologies above 256 experts remain
-  open.
+  across every rank. The explicit-DSB candidate also passed 2,048 EP8
+  generations with 64 experts per rank (512 global experts). Multi-node EP
+  remains open.
 
 ### Bracketed critical-path timing
 
@@ -209,11 +211,12 @@ The host medians agree for the six positive cases, improving 2.7--19.4%. For
 graph `active=1`, host medians regress 3.5--14.4%. This is why a tiny-wave
 fallback is evidence-driven rather than speculative complexity.
 
-### DCCI ablation
+### Visibility barrier closure
 
 The explicit `DISPATCH_FFN_COMBINE_DIRECT_INGRESS_SKIP_DCCI` ablation passed
-the current EP2 repeated-generation test and is directionally positive for
-larger routes, but graph `active=1` remains inconclusive:
+the tracked EP2+EP4 tests, a 56-generation EP8 pilot, and 2,048 changing EP8
+generations. It is directionally positive for larger routes, but graph
+`active=1` remains inconclusive:
 
 | Case | DCCI before | No DCCI | DCCI after | Judgment |
 |---|---:|---:|---:|---|
@@ -221,8 +224,26 @@ larger routes, but graph `active=1` remains inconclusive:
 | prefill M=256, spread | 532.41 us | 526.40 us | 547.83 us | 1.1--3.9% faster |
 | graph M=64, active=1 | 340.28 us | 352.15 us | 353.67 us | inconclusive |
 
-Keep conservative DCCI in any candidate intended to advance beyond an
-ablation.
+CANN 9.0.X documents that DMA access to GM has no DataCache consistency issue,
+that scalar reads after external modification require DCCI, that A2 `DataCopy`
+supports inter-device transfer, and that `DataSyncBarrier` waits for preceding
+GM/memory-access instructions. The tracked candidate therefore replaces the
+byte-scaled payload DCCI with an explicit sequence: per-producer DDR DSB, local
+AIV join, completed scalar epoch publication, all-source epoch observation,
+then receiver DDR DSB before MTE2/Cube consumption. Scalar epoch accesses keep
+DCCI.
+
+The clean tracked-source build was byte-identical to the disposable DSB
+prototype. It passed the tracked EP2+EP4 suite (`2 passed, 21 warnings in
+72.33s`), a 56-generation EP8 pilot, and 2,048 changing EP8 generations with
+exact output and expert-count oracles. A focused graph `active=16` S-DSB-S
+bracket with 50 warmups and 200 samples measured 389.26 us for DSB versus
+402.52 and 457.54 us for payload DCCI, a 3.3--14.9% improvement. `active=1`
+falls back before this path and is not discriminating. The detailed protocol
+note links the authoritative API pages and records the sequence. A separate
+2,048-generation EP8 run with 64 experts per rank (512 global experts) passed
+all route families and exact oracles, closing the previous above-256-expert gap
+on a single node.
 
 ### msopprof mechanism evidence
 
@@ -292,28 +313,28 @@ bash csrc/build.sh --pkg --soc=ascend910b \
 Prefer a fresh `csrc/build` from a clean checkout for compile-option
 experiments. An incremental build previously refreshed
 `csrc/build/impl/dynamic/dispatch_ffn_combine_bf16.py` but left the per-op
-driver below stale with `DISPATCH_FFN_COMBINE_DIRECT_INGRESS_SKIP_DCCI`:
+driver below stale with an obsolete DCCI-ablation macro:
 
 ```text
 csrc/build/binary/ascend910b/src/dispatch_ffn_combine_bf16/DispatchFFNCombineBF16.py
 ```
 
 Before trusting the package, inspect that generated driver and verify the
-selector macro is present and `SKIP_DCCI` is absent:
+selector macro is present and the obsolete ablation macro is absent:
 
 ```bash
 rg 'DIRECT_INGRESS|SKIP_DCCI' \
   csrc/build/binary/ascend910b/src/dispatch_ffn_combine_bf16/DispatchFFNCombineBF16.py
 ```
 
-The known-good compile-only selector objects were 609,656 bytes, up from
-605,560 bytes without the selector. Their hashes were:
+The known-good explicit-DSB selector objects are 605,560 bytes. Their hashes
+are:
 
 ```text
-348360e09a14e3ce136b87885316cd72f82b2f6f38a27c1f8d34789d28a7c235
-2ffd50f339df6e9246612c920235891a0a6ac49ef1eb6d0e5aef141ae2325dcf
-fad05997576de6bcdae46713e0092742f0f3cf6939237630e3e5a605146a5c1d
-985515a6f4459d613381cb0202fa5e972fd4fb1d6392912b2e70f45d872d4ace
+23fb8f4853a54d1fc116ac58d15e27d7e148700e48dc5a9b751b56f8e2f11182
+64d3f9751ced90add45d1a34a0c961fb52c06863a25347cc8d147ecad79be908
+b7f63a16daa8f2589abd91b77699db0515aef067385bf0233ead8741c97833f8
+8e5e0d116153fe198f36bbaacfad12f538a6071ff7c0030be04f3dac08a7a3fa
 ```
 
 Do not treat matching hashes as hardware validation; they only help detect a
@@ -351,10 +372,12 @@ Use this order so a failure has a small search space:
 6. Restore the release package, stop/remove only this task's container, and
    confirm the physical devices returned to their prior idle state.
 
-Promotion gates remain: multi-node or above-256-expert bounds if required, the
-narrowly missed 5% tiny-wave target, and a conservative visibility boundary.
-The dense count exchange is still present and can be revisited later, but
-removing it is not part of the current closed optimization line.
+Promotion gates remain: multi-node topology coverage, the narrowly missed 5%
+tiny-wave target, and the bounded one-wave epoch-skew assumption. Single-node
+EP8 with 512 global experts passes, and the visibility gate is closed by
+explicit documented memory-completion barriers. The dense count exchange is
+still present and can be revisited later, but removing it is not part of the
+current closed optimization line.
 
 ## Why this host was abandoned
 

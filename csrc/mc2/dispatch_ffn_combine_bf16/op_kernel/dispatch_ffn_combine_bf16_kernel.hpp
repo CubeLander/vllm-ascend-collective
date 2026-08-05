@@ -911,11 +911,11 @@ private:
                 rows * params.problemShape.k(), params.ubMoveNum);
         }
 
-        // All local producer cores finish their payload writes before one
-        // source-owned epoch publishes the entire sealed request. Keep this
-        // ingress generation independent from the existing egress barrier:
-        // reusing CrossRankSync's counter lets an empty destination rank enter
-        // the next phase while its peer is still consuming the prior phase.
+        // Complete every producer core's MTE3 payload writes before one
+        // source-owned epoch publishes the sealed request. SyncAll alone only
+        // synchronizes the local AIVs; the DDR barrier supplies the preceding
+        // memory-completion edge for each core.
+        AscendC::DataSyncBarrier<AscendC::MemDsbT::DDR>();
         AscendC::SyncAll<true>();
         if (coreIdx == 0) {
             __gm__ uint32_t *localReady = reinterpret_cast<__gm__ uint32_t *>(
@@ -924,6 +924,7 @@ private:
             uint32_t epoch = gm_load(localReady) + 1U;
             gm_store(localReady, epoch);
             gm_dcci(localReady);
+            AscendC::DataSyncBarrier<AscendC::MemDsbT::DDR>();
 
             for (int32_t srcRank = 0; srcRank < params.EP; ++srcRank) {
                 __gm__ uint32_t *remoteReady =
@@ -935,36 +936,11 @@ private:
                 // than waiting for an exact value that has already passed.
                 gm_signal_wait_until_eq_for_barrier(remoteReady, epoch);
             }
+            // Order the completed epoch reads before any local MTE2/Cube
+            // consumer observes the peer-written payload.
+            AscendC::DataSyncBarrier<AscendC::MemDsbT::DDR>();
         }
         AscendC::SyncAll<true>();
-
-#ifndef DISPATCH_FFN_COMBINE_DIRECT_INGRESS_SKIP_DCCI
-        // The payload arrives through peer writes, while GMM1 subsequently
-        // consumes the local window through the Cube cache hierarchy. A rank
-        // barrier proves publication ordering but does not itself evict data
-        // cached by the preceding replay. Invalidate only the contiguous rows
-        // received by this rank before publishing AIV-to-AIC readiness;
-        // changing-route replay otherwise observes the previous wave.
-        int64_t receivedRows = 0;
-        for (int32_t groupIdx = 0; groupIdx < params.expertPerRank;
-             ++groupIdx) {
-            receivedRows += cumsumMM(
-                (params.EP - 1) * params.expertPerRank + groupIdx);
-        }
-        receivedRows = min(
-            receivedRows, static_cast<int64_t>(params.maxOutputSize));
-        const int64_t receivedBytes =
-            receivedRows * params.problemShape.k() * sizeof(ElementA);
-        for (int64_t byteOffset =
-                 static_cast<int64_t>(coreIdx) * AscendC::CACHE_LINE_SIZE;
-             byteOffset < receivedBytes;
-             byteOffset += static_cast<int64_t>(coreNum) *
-                           AscendC::CACHE_LINE_SIZE) {
-            gm_dcci(reinterpret_cast<__gm__ uint8_t *>(
-                shmem() + peermemInfo.offsetDirectA + byteOffset));
-        }
-        AscendC::SyncAll<true>();
-#endif
     }
 #endif
 

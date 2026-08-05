@@ -33,7 +33,7 @@ route locally into source-owned offsetA
   -> all local producer cores join
   -> one source-owned epoch publishes the complete source wave
   -> every destination waits for every source epoch
-  -> invalidate only the received contiguous input rows
+  -> order completed epoch reads before MTE2/Cube consumption
   -> publish the existing compact AIV-to-AIC expert progress sequence
 ```
 
@@ -54,8 +54,11 @@ The epoch is a source-owned unsigned 32-bit modular counter, independent of the
 existing egress completion state. A waiter accepts the requested epoch or one
 generation ahead, matching the existing barrier's bounded-skew rule and
 avoiding an exact-value ABA hang, including across `UINT32_MAX -> 0`.
-Payload cache maintenance is distributed by hardware cache line, so distinct
-cores never issue DCCI against the same line.
+Every producer core completes its MTE3 payload writes with a DDR data-sync
+barrier before the local AIV join. The publishing core completes its scalar
+epoch store, and the receiving core orders completed epoch reads before local
+MTE2/Cube consumption. DCCI remains on scalar epoch accesses but is not applied
+to the DMA payload.
 
 Egress is intentionally unchanged. GMM2 continues to stream each completed
 source fragment directly into that source rank's return region; this prototype
@@ -115,9 +118,10 @@ epoch-wrap correctness gates.
 Finally, the repeated-wave harness passed both a 56-generation pilot and 2,048
 generations at EP8, using all eight devices, 16 local experts per rank, and a
 2,048-row one-destination capacity. The long run rotated the hot destination
-across every rank. Current single-node evidence therefore covers EP2, EP4, and
-EP8; 256 global experts at EP4; 128 global experts at EP8; and modular epoch
-wrap. Multi-node EP and topologies above 256 global experts remain untested.
+across every rank. The explicit-DSB candidate later repeated 2,048 EP8
+generations with 64 local experts per rank. Current single-node evidence
+therefore covers EP2, EP4, and EP8; 512 global experts at EP8; and modular epoch
+wrap. Multi-node EP remains untested.
 
 ## First performance discrimination
 
@@ -172,10 +176,11 @@ input buffer, while AIC and egress retain the matching direct-buffer offsets.
 The selector therefore changes only how input rows arrive, not their final
 layout or the AIC/AIV address contract.
 
-The candidate passed a clean Ascend 910B package compile for all four registered
-dtype/format variants. The generated driver was checked to contain both direct
-ingress macros and retain DCCI; all four selector objects were 609,656 bytes and
-matched the known compile-only checkpoint hashes.
+The original selector passed a clean Ascend 910B package compile for all four
+registered dtype/format variants. The generated driver was checked to contain
+both direct-ingress macros; all four payload-DCCI selector objects were 609,656
+bytes and matched the known compile-only checkpoint hashes. The later explicit
+DSB candidate compiled to 605,560-byte objects and is recorded below.
 
 Five fresh EP2 processes bracketed selector and direct-only objects in
 S-D-S-D-S order, with 10 warmups and 50 device-event samples per case. Exact
@@ -232,24 +237,25 @@ The direct-placement mechanism passes the Phase 2 EP2 and EP4 correctness
 gates and has a strong first performance signal. It is not ready to become the
 production default because:
 
-1. single-node EP8 and EP4 with 256 global experts are validated, but
-   multi-node EP and topologies above 256 global experts are not;
+1. single-node EP8 with 512 global experts is validated, but multi-node EP is
+   not;
 2. the graph `active=1` selector is consistently faster, but its 4.34% median
    gain narrowly misses the preregistered 5% useful-effect target;
 3. the source-owned epoch assumes a fresh common initial generation and a
    bounded one-wave skew; 2,048-generation communicator reuse and adversarial
    unsigned wrap pass, but larger skew is outside the protocol;
-4. the DCCI ablation passes the current test but is not yet strong enough to
-   replace the conservative visibility boundary; and
-5. the dense count exchange remains, even though per-expert receiver pulls and
+4. the dense count exchange remains, even though per-expert receiver pulls and
    their barriers are gone.
 
-### DCCI ablation
+### Visibility barrier closure
 
 The received-row DCCI loop can be removed in a disposable build with
-`DISPATCH_FFN_COMBINE_DIRECT_INGRESS_SKIP_DCCI`. That build passed the complete
-two-rank repeated-generation test. A 100-sample run was bracketed by two builds
-with DCCI:
+`DISPATCH_FFN_COMBINE_DIRECT_INGRESS_SKIP_DCCI`. In addition to the original
+two-rank repeated-generation result, a clean four-variant selector build with
+that macro passed both tracked EP2+EP4 tests (`2 passed, 21 warnings in
+71.20s`), a 56-generation EP8 pilot, and 2,048 changing EP8 generations with
+exact output and expert-count oracles. A 100-sample run was bracketed by two
+builds with DCCI:
 
 | Case | DCCI before | No DCCI | DCCI after | Judgment |
 |---|---:|---:|---:|---|
@@ -258,14 +264,53 @@ with DCCI:
 | graph M=64, active=1 | 340.28 us | 352.15 us | 353.67 us | inconclusive |
 
 Removing DCCI is directionally useful for the larger route families but does
-not explain the smallest-wave floor. More importantly, repeated correctness is
-not a substitute for a documented peer-write-to-Cube visibility contract. The
-conservative direct prototype therefore keeps DCCI by default and retains the
-skip macro only as an explicit experimental ablation.
+not explain the smallest-wave floor. The authoritative CANN 9.0.X
+[`DataCacheCleanAndInvalid` contract][dcci-contract] narrows the question: DMA
+access to GM has no DataCache consistency issue, while scalar reads of GM that
+may be externally modified require DCCI. Direct ingress writes through MTE3
+and GMM1 reads GM through the Cube data-movement path, so the payload itself is
+not the scalar-cache case described by that API. CANN also documents that
+[`DataCopy` supports inter-device transfer on A2][datacopy-contract] and that
+an HCCL [`WindowsIn` address may be used directly as computation input or
+output][windows-in-contract].
 
-The next highest-value work is resolving the peer-write-to-Cube visibility
-boundary from an authoritative contract; repeated success alone is not enough
-to remove DCCI. Exact per-source cycle attribution would sharpen the mechanism
-diagnosis, but the current Source product exposes visits rather than cycles.
-Neither the compile-time guard nor dispatch policy should be widened until the
-visibility boundary and the narrowly missed tiny-wave target are resolved.
+The original epoch did not, however, explicitly complete every producer's MTE3
+pipeline before publishing its unrelated scalar. The candidate now closes that
+gap with documented [`DataSyncBarrier<MemDsbT::DDR>` semantics][dsb-contract]:
+
+```text
+each producer core completes its peer MTE3 writes with DDR DSB
+  -> local AIV SyncAll
+  -> core 0 publishes and completes the source epoch with DDR DSB
+  -> every destination observes every source epoch
+  -> destination DDR DSB orders the polls before local MTE2/Cube consumption
+```
+
+This is an explicit memory-completion and post-transfer synchronization
+sequence rather than an inference that a local core barrier covers remote
+payload writes. Scalar epoch accesses retain DCCI, as required by the scalar GM
+cache contract; the byte-scaled payload DCCI loop and its skip macro are
+removed.
+
+A clean four-variant build from the tracked source was byte-identical to the
+disposable DSB prototype. That prototype passed the tracked EP2+EP4 suite (`2
+passed, 21 warnings in 72.33s`), a 56-generation EP8 pilot, and 2,048 changing
+EP8 generations with exact output and expert-count oracles. In a focused
+S-DSB-S bracket for graph `active=16` (50 warmups and 200 samples), the DSB
+candidate measured 389.26 us versus 402.52 and 457.54 us for the payload-DCCI
+selector, 3.3--14.9% faster. Graph `active=1` falls back before direct ingress,
+so it is not a discriminating case for this change. A separate 2,048-generation
+EP8 campaign with 64 experts per rank (512 global experts) also passed every
+route family and exact oracle, closing the previous above-256-expert gap on one
+node.
+
+The visibility gate is therefore closed for the single-node A2 candidate. The
+remaining promotion gates are multi-node topology coverage, the narrowly
+missed tiny-wave target, and the bounded one-wave epoch-skew assumption. Exact
+per-source cycle attribution could still sharpen the mechanism diagnosis, but
+the current Source product exposes visits rather than cycles.
+
+[dcci-contract]: https://www.hiascend.com/document/detail/en/CANNCommunityEdition/900/API/ascendcopapi/atlasascendc_api_07_0177.html
+[datacopy-contract]: https://www.hiascend.com/document/detail/en/CANNCommunityEdition/900/API/ascendcopapi/atlasascendc_api_07_0103.html
+[dsb-contract]: https://www.hiascend.com/document/detail/zh/CANNCommunityEdition/900/API/ascendcopapi/atlasascendc_api_07_0272.html
+[windows-in-contract]: https://www.hiascend.com/document/detail/en/canncommercial/850/API/ascendcopapi/atlasascendc_api_07_0882.html
