@@ -1,8 +1,8 @@
 # Dispatch-FFN-Combine Phase 2 direct-ingress prototype
 
-Status: experimental compile-time prototype; correctness passed on EP2 and the
-first bracketed performance result is positive for six of seven route families.
-The production path remains unchanged unless
+Status: experimental compile-time prototype; exactness passed repeated EP2 and
+EP4 validation, and the zero-scan sparse selector has hardware crossover
+evidence. The production path remains unchanged unless
 `DISPATCH_FFN_COMBINE_DIRECT_INGRESS` is defined.
 
 ## Question
@@ -92,9 +92,17 @@ A separate long-reuse harness then held one EP2 communicator and peer window
 open for 2,048 consecutive generations. It varied active-token counts over
 `0, 1, 2, 7, 16, 31, 64` and rotated through all-empty, one-destination,
 local-only, peer-only, and mixed expert routes. Every generation passed exact
-output and expert-count oracles. This closes the ordinary changing-generation
-stress gate on EP2; it does not exercise signed epoch wrap or a larger EP
-topology.
+output and expert-count oracles.
+
+The same harness then passed 2,048 generations on EP4, including empty ranks,
+one-destination waves, and local-only, peer-only, and mixed routes. Its capacity
+is derived as `EP * M * topK`: retaining EP2's 512-row constant at EP4 caused
+the expected one-destination truncation at 1,024 rows, while expert counts
+remained exact. Correcting that test precondition produced a clean 28-wave
+pilot and the full 2,048-wave pass. A tracked four-rank regression with 64
+local experts per rank (256 global experts) also passes. These results close
+the current EP4 and larger-topology correctness gates; signed epoch wrap and
+topologies beyond EP4/256 experts remain untested.
 
 ## First performance discrimination
 
@@ -149,18 +157,21 @@ input buffer, while AIC and egress retain the matching direct-buffer offsets.
 The selector therefore changes only how input rows arrive, not their final
 layout or the AIC/AIV address contract.
 
-The candidate has passed a forced Ascend 910B package compile for all four
-registered dtype/format variants. The validation also checked the generated
-per-op compiler driver: an earlier incremental build had retained a stale
-`SKIP_DCCI` option despite regenerating the dynamic driver, so its unchanged
-objects were rejected. After refreshing that driver and all four generation
-stamps, selector objects grew from 605,560 to 609,656 bytes and received new
-hashes. Hardware correctness and crossover timing remain pending: newly
-created development containers currently fail DCMI initialization and report
-zero visible NPUs despite idle physical devices. The first recovery experiment
-should bracket the selector build against direct ingress on EP2 for graph
-`active=1` and `active=16`, then run the existing 2,048-generation route stress
-before widening to EP4.
+The candidate passed a clean Ascend 910B package compile for all four registered
+dtype/format variants. The generated driver was checked to contain both direct
+ingress macros and retain DCCI; all four selector objects were 609,656 bytes and
+matched the known compile-only checkpoint hashes.
+
+Five fresh EP2 processes bracketed selector and direct-only objects in
+S-D-S-D-S order, with 10 warmups and 50 device-event samples per case. Exact
+output passed throughout. At graph `active=1`, selector observations were
+291.02, 290.69, and 295.63 us versus direct-only observations of 309.59 and
+298.84 us. The median reduction was 4.34%: consistently positive, but narrowly
+below the preregistered 5% useful-effect target. At `active=16`, selector and
+direct-only medians were 429.18 and 431.46 us respectively, a 0.53% difference
+inside the 5% parity bound. The selector therefore demonstrates the intended
+crossover without regressing the direct path, but the smallest-wave gain should
+not be reported as meeting a >=5% target.
 
 ## msopprof evidence
 
@@ -202,13 +213,14 @@ artifact. The conservative release object was restored after collection.
 
 ## Gate result and next work
 
-The direct-placement mechanism passes the Phase 2 EP2 correctness gate and has
-a strong first performance signal. It is not ready to become the production
-default because:
+The direct-placement mechanism passes the Phase 2 EP2 and EP4 correctness
+gates and has a strong first performance signal. It is not ready to become the
+production default because:
 
-1. generic EP and larger expert topology bounds are not yet validated;
-2. the graph `active=1` crossover has a zero-scan candidate, but still needs
-   hardware correctness and bracketed timing evidence;
+1. EP4 with 256 global experts is validated, but wider generic EP/topology
+   bounds are not;
+2. the graph `active=1` selector is consistently faster, but its 4.34% median
+   gain narrowly misses the preregistered 5% useful-effect target;
 3. the source-owned epoch assumes a fresh common initial generation and a
    bounded one-wave skew; 2,048-generation communicator reuse passes, but
    signed wrap still needs an adversarial test;
@@ -236,9 +248,9 @@ not a substitute for a documented peer-write-to-Cube visibility contract. The
 conservative direct prototype therefore keeps DCCI by default and retains the
 skip macro only as an explicit experimental ablation.
 
-The next highest-value experiment is EP2 hardware validation of the zero-scan
-crossover candidate, followed by a generic-EP correctness run. Exact per-source
-cycle attribution would sharpen the mechanism diagnosis, but the current
-Source product exposes visits rather than cycles and should not block the
-generic-topology gate. Only after those gates should the prototype's
-compile-time guard or dispatch policy be widened.
+The next highest-value correctness experiment is an adversarial epoch-wrap
+test, followed by a wider generic EP/topology bound if production targets need
+it. Exact per-source cycle attribution would sharpen the mechanism diagnosis,
+but the current Source product exposes visits rather than cycles. Neither the
+compile-time guard nor dispatch policy should be widened until the epoch and
+visibility boundaries are resolved.

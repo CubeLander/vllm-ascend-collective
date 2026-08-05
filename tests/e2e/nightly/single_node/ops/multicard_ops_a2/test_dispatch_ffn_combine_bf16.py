@@ -40,6 +40,10 @@ def _run_rank(rank: int, world_size: int, port: int) -> None:
         hidden_size = 256
         ffn_size = 256
         gate_up_size = 2 * ffn_size
+        # A changing-route generation may send every rank's M * topK rows to
+        # one destination. Keep the capacity large enough for that exactness
+        # oracle at both EP2 and EP4.
+        max_output_size = world_size * tokens * top_k
 
         torch_npu.npu.config.allow_internal_format = True
 
@@ -96,7 +100,7 @@ def _run_rank(rank: int, world_size: int, port: int) -> None:
                 bias2=empty_bias,
                 probs=probs,
                 group=_get_hcomm_name(rank),
-                max_output_size=512,
+                max_output_size=max_output_size,
                 out=out,
                 expert_token_nums=expert_token_nums,
             )
@@ -138,7 +142,7 @@ def _run_rank(rank: int, world_size: int, port: int) -> None:
                 bias2=empty_bias,
                 probs=probs,
                 group=_get_hcomm_name(rank),
-                max_output_size=512,
+                max_output_size=max_output_size,
                 out=out,
                 expert_token_nums=expert_token_nums,
             )
@@ -166,9 +170,9 @@ def _run_rank(rank: int, world_size: int, port: int) -> None:
         expected_masked_counts = torch.bincount(torch.cat(masked_routes), minlength=global_experts).to(torch.int32)
         expected_masked_counts = expected_masked_counts[rank * local_experts : (rank + 1) * local_experts]
         expected_masked = torch.zeros((active_tokens, hidden_size), dtype=torch.bfloat16)
-        expected_masked[:, 0] = (
-            (masked_expert_idx_by_rank[rank][:active_tokens] + 1) * probs_cpu[:active_tokens]
-        ).sum(dim=-1).to(torch.bfloat16) * silu_one
+        expected_masked[:, 0] = ((masked_expert_idx_by_rank[rank][:active_tokens] + 1) * probs_cpu[:active_tokens]).sum(
+            dim=-1
+        ).to(torch.bfloat16) * silu_one
 
         masked_expert_idx = masked_expert_idx_by_rank[rank].npu()
         out.fill_(torch.nan)
@@ -184,7 +188,7 @@ def _run_rank(rank: int, world_size: int, port: int) -> None:
             bias2=empty_bias,
             probs=probs,
             group=_get_hcomm_name(rank),
-            max_output_size=512,
+            max_output_size=max_output_size,
             x_active_mask=x_active_mask.npu(),
             out=out,
             expert_token_nums=expert_token_nums,
@@ -199,12 +203,10 @@ def _run_rank(rank: int, world_size: int, port: int) -> None:
         # expert must skip its GEMM without shifting the weight-list index used
         # by the next active expert.
         weight1_list_nz = [
-            torch_npu.npu_format_cast(weight1[local_expert].npu(), 29)
-            for local_expert in range(local_experts)
+            torch_npu.npu_format_cast(weight1[local_expert].npu(), 29) for local_expert in range(local_experts)
         ]
         weight2_list_nz = [
-            torch_npu.npu_format_cast(weight2[local_expert].npu(), 29)
-            for local_expert in range(local_experts)
+            torch_npu.npu_format_cast(weight2[local_expert].npu(), 29) for local_expert in range(local_experts)
         ]
         empty_scales = [torch.empty(0, dtype=torch.int64) for _ in range(local_experts)]
 
@@ -221,7 +223,7 @@ def _run_rank(rank: int, world_size: int, port: int) -> None:
             bias2=empty_bias,
             probs=probs,
             group=_get_hcomm_name(rank),
-            max_output_size=512,
+            max_output_size=max_output_size,
             x_active_mask=x_active_mask.npu(),
             out=out,
             expert_token_nums=expert_token_nums,
@@ -237,5 +239,12 @@ def _run_rank(rank: int, world_size: int, port: int) -> None:
 @torch.inference_mode()
 def test_dispatch_ffn_combine_bf16_two_ranks():
     world_size = 2
+    port = 29501 + random.randint(0, 10000)
+    mp.spawn(_run_rank, args=(world_size, port), nprocs=world_size, join=True)
+
+
+@torch.inference_mode()
+def test_dispatch_ffn_combine_bf16_four_ranks():
+    world_size = 4
     port = 29501 + random.randint(0, 10000)
     mp.spawn(_run_rank, args=(world_size, port), nprocs=world_size, join=True)

@@ -11,8 +11,8 @@ Source branch: `agent/moe-gmm2-cutthrough`
 Source head before this handoff: `5cd9c9fe4096c0796290df7ec9c9f913a26b2a2f`
 
 Status: experimental and compile-time guarded. The production default is
-unchanged. The immediate job on a healthy Ascend host is to validate the
-zero-scan sparse fallback on EP2, then widen correctness to EP4.
+unchanged. Hardware revival on a healthy Ascend 910B host has now validated the
+zero-scan sparse fallback on EP2 and widened repeated exactness to EP4.
 
 ## State in one page
 
@@ -25,19 +25,20 @@ seals each source wave. Reply transmission is deliberately still streaming:
 GMM2 sends each completed source fragment without waiting to batch the whole
 reply.
 
-The sealed-wave direct-ingress mechanism has passed the ordinary EP2
-end-to-end test and a 2,048-generation exact-output stress run. Its bracketed
-critical-path timing is positive in six of seven route families. The lone
-unresolved family is a graph-padded window with one active token, where the
-fixed epoch protocol is not reliably amortized.
+The sealed-wave direct-ingress mechanism has passed tracked EP2 and EP4
+end-to-end tests and 2,048-generation exact-output stress runs at both EP
+sizes. Its bracketed critical-path timing is positive in six of seven original
+route families. The zero-scan selector now addresses the graph-padded window
+with one active token, where the fixed epoch protocol was not reliably
+amortized.
 
 A zero-scan selector now keeps that tiny route on the legacy pull path. It
 uses the production prefix-mask contract and one padding lane in each already
 exchanged count row, adds no communication round, and reads O(EP) scalars
 rather than scanning the dense count matrix. All four registered Ascend 910B
-dtype/format variants compile with the selector, but hardware correctness and
-performance are not yet evidence: this host stopped exposing NPUs to newly
-created containers before those runs could start.
+dtype/format variants compile with the selector. EP2 hardware exactness,
+bracketed crossover timing, EP4 exactness, and repeated reuse are now evidence;
+signed epoch wrap and wider production topologies remain open.
 
 ## Code and evidence map
 
@@ -45,7 +46,7 @@ created containers before those runs could start.
 |---|---|---|
 | Kernel and compile guards | `csrc/mc2/dispatch_ffn_combine_bf16/op_kernel/dispatch_ffn_combine_bf16_kernel.hpp` | Direct placement, epochs, cache maintenance, fallback selector |
 | Protocol and experimental receipts | `docs/dispatch-ffn-combine-phase2-direct-ingress.md` | Authoritative design, correctness, timing, msopprof, and remaining gates |
-| Tracked EP2 regression | `tests/e2e/nightly/single_node/ops/multicard_ops_a2/test_dispatch_ffn_combine_bf16.py` | Dense and changing routes, graph padding, sparse tensor-list weights |
+| Tracked EP2/EP4 regression | `tests/e2e/nightly/single_node/ops/multicard_ops_a2/test_dispatch_ffn_combine_bf16.py` | Dense and changing routes, graph padding, sparse tensor-list weights |
 | Production mask construction | `vllm_ascend/ascend_forward_context.py` | Builds a true-prefix/false-suffix `mc2_mask` |
 | Production wrapper contract | `vllm_ascend/ops/fused_moe/token_dispatcher.py` | Passes `mc2_mask` only in uniform-token mode (`global_bs == 0`) |
 | Live-source container helper | `tools/docker/source_dev_container.sh` | Mounts this checkout and an exact vLLM source into a task-specific container |
@@ -170,8 +171,15 @@ reintroduce a serialized O(EP² × local-experts) scan or a new selection round.
 - One EP2 communicator and peer window survived 2,048 consecutive generations
   with exact output and expert-count oracles. It rotated through all-empty,
   one-destination, local-only, peer-only, and mixed routes.
-- EP4, larger expert topologies, and signed epoch wrap remain open.
-- The selector itself is compile-validated only; it has not run on hardware.
+- One EP4 communicator and peer window survived the same 2,048-generation
+  matrix after sizing the test capacity for the 1,024-row one-destination
+  maximum. A tracked EP4 regression also passed with 64 local experts per rank
+  (256 global experts).
+- The selector passed EP2 exactness and five fresh-process S-D-S-D-S crossover
+  runs. At active=1 its median was 291.02 us versus 304.22 us direct-only,
+  4.34% faster but narrowly below the preregistered 5% useful-effect target.
+  At active=16 it was 0.53% faster, inside the 5% parity bound.
+- Signed epoch wrap and topologies beyond EP4/256 global experts remain open.
 
 ### Bracketed critical-path timing
 
@@ -335,10 +343,11 @@ Use this order so a failure has a small search space:
 6. Restore the release package, stop/remove only this task's container, and
    confirm the physical devices returned to their prior idle state.
 
-Promotion gates remain: generic EP/topology correctness, signed epoch wrap,
-selector crossover evidence, and a conservative visibility boundary. The
-dense count exchange is still present and can be revisited later, but removing
-it is not part of the current closed optimization line.
+Promotion gates remain: wider generic EP/topology bounds if required, signed
+epoch wrap, the narrowly missed 5% tiny-wave target, and a conservative
+visibility boundary. The dense count exchange is still present and can be
+revisited later, but removing it is not part of the current closed optimization
+line.
 
 ## Why this host was abandoned
 
@@ -355,8 +364,9 @@ hardware gates above rather than debugging the protocol against this host.
 
 ## Boundaries to preserve
 
-- Keep claims observation-backed: six positive route families, one unresolved
-  tiny graph route, and no hardware claim yet for the selector.
+- Keep claims observation-backed: six positive original route families, a
+  4.34% selector median gain on the tiny graph route, active=16 parity, and
+  exact EP2/EP4 reuse. Do not round the tiny-route result up to the 5% target.
 - Treat unknown behavior as a signal to investigate, not noise to discard.
 - Do not force-push or merge the divergent historical source branch merely to
   publish experiments; the dedicated handoff branch is the transferable
