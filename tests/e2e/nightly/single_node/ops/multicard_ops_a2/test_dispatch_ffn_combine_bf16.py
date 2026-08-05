@@ -153,15 +153,24 @@ def _run_rank(rank: int, world_size: int, port: int) -> None:
         active_tokens = 1
         x_active_mask = torch.zeros(tokens, dtype=torch.bool)
         x_active_mask[:active_tokens] = True
+        masked_expert_idx_by_rank = []
         masked_routes = []
         for source_rank in range(world_size):
+            # Put the live token on high-numbered experts so the sparse path
+            # crosses long runs of empty experts. Rank zero receives no local
+            # work, while rank one must retain the exact late weight indices.
             source_expert_idx = torch.arange(tokens * top_k, dtype=torch.int32).reshape(tokens, top_k)
-            source_expert_idx = (source_expert_idx + source_rank * top_k) % global_experts
+            source_expert_idx = (global_experts - 1 - source_expert_idx - source_rank * top_k) % global_experts
+            masked_expert_idx_by_rank.append(source_expert_idx)
             masked_routes.append(source_expert_idx[:active_tokens].reshape(-1))
         expected_masked_counts = torch.bincount(torch.cat(masked_routes), minlength=global_experts).to(torch.int32)
         expected_masked_counts = expected_masked_counts[rank * local_experts : (rank + 1) * local_experts]
+        expected_masked = torch.zeros((active_tokens, hidden_size), dtype=torch.bfloat16)
+        expected_masked[:, 0] = (
+            (masked_expert_idx_by_rank[rank][:active_tokens] + 1) * probs_cpu[:active_tokens]
+        ).sum(dim=-1).to(torch.bfloat16) * silu_one
 
-        masked_expert_idx = expert_idx.clone()
+        masked_expert_idx = masked_expert_idx_by_rank[rank].npu()
         out.fill_(torch.nan)
         expert_token_nums.fill_(-1)
         torch.ops._C_ascend.dispatch_ffn_combine(
@@ -182,7 +191,7 @@ def _run_rank(rank: int, world_size: int, port: int) -> None:
         )
         torch_npu.npu.synchronize()
 
-        torch.testing.assert_close(out[:active_tokens].cpu(), expected[:active_tokens], rtol=0.02, atol=0.02)
+        torch.testing.assert_close(out[:active_tokens].cpu(), expected_masked, rtol=0.02, atol=0.02)
         torch.testing.assert_close(expert_token_nums.cpu(), expected_masked_counts)
 
         # Exercise the one-tensor-per-expert ABI as well as the packed tensor
@@ -219,7 +228,7 @@ def _run_rank(rank: int, world_size: int, port: int) -> None:
         )
         torch_npu.npu.synchronize()
 
-        torch.testing.assert_close(out[:active_tokens].cpu(), expected[:active_tokens], rtol=0.02, atol=0.02)
+        torch.testing.assert_close(out[:active_tokens].cpu(), expected_masked, rtol=0.02, atol=0.02)
         torch.testing.assert_close(expert_token_nums.cpu(), expected_masked_counts)
     finally:
         dist.destroy_process_group()
