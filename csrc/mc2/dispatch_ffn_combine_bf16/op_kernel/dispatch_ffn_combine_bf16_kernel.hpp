@@ -238,7 +238,16 @@ private:
 
         cumsumMM.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t*>(workspaceInfo.ptrcumsumMM));
 
+#ifdef DISPATCH_FFN_COMBINE_DIRECT_INGRESS
+        if (peermemInfo.directIngressEnabled) {
+            gmA.SetGlobalBuffer(reinterpret_cast<__gm__ ElementA *>(
+                shmem() + peermemInfo.offsetDirectA));
+        } else {
+            gmA.SetGlobalBuffer(reinterpret_cast<__gm__ ElementA *>(workspaceInfo.ptrA));
+        }
+#else
         gmA.SetGlobalBuffer(reinterpret_cast<__gm__ ElementA *>(workspaceInfo.ptrA));
+#endif
         gmC.SetGlobalBuffer(reinterpret_cast<__gm__ ElementC *>(workspaceInfo.ptrC));
 
         gmPermutedToken.SetGlobalBuffer(reinterpret_cast<__gm__ ElementD1 *>(workspaceInfo.ptrPermutedToken));
@@ -781,6 +790,131 @@ private:
         AscendC::DataCopy(tokenPerExpert, tmp, num);
     }
 
+#ifdef DISPATCH_FFN_COMBINE_DIRECT_INGRESS
+    // Experimental sealed-wave ingress. The existing routing pass first
+    // materializes this rank's route-expanded rows in its local offsetA
+    // staging region. Once every rank has published the count matrix, each
+    // source can derive the exact destination row for every
+    // (destination-rank, local-expert) fragment and push the whole sealed
+    // request batch into a peer-visible expert-contiguous buffer. No remote
+    // atomic allocation or per-expert network submission is needed.
+    CATLASS_DEVICE
+    void PushDirectIngress(Params const &params)
+    {
+        AscendC::GlobalTensor<ElementA> gmLocalStaging;
+        gmLocalStaging.SetGlobalBuffer(reinterpret_cast<__gm__ ElementA *>(
+            shmem() + peermemInfo.offsetA));
+
+        const int32_t targetCount = params.EP * params.expertPerRank;
+        for (int32_t target = coreIdx; target < targetCount; target += coreNum) {
+            const int32_t dstRank = target / params.expertPerRank;
+            const int32_t groupIdx = target % params.expertPerRank;
+            uint32_t rows = tokenPerExpert(
+                tokenPerExpertLayout(params.rank, dstRank, groupIdx));
+            if (rows == 0) {
+                continue;
+            }
+
+            // Source staging is ordered by global expert. This prefix is
+            // source-owned and therefore needs no remote allocation.
+            uint32_t srcRow = 0;
+            for (int32_t priorDst = 0; priorDst < dstRank; ++priorDst) {
+                for (int32_t priorGroup = 0;
+                     priorGroup < params.expertPerRank; ++priorGroup) {
+                    srcRow += tokenPerExpert(tokenPerExpertLayout(
+                        params.rank, priorDst, priorGroup));
+                }
+            }
+            for (int32_t priorGroup = 0; priorGroup < groupIdx; ++priorGroup) {
+                srcRow += tokenPerExpert(tokenPerExpertLayout(
+                    params.rank, dstRank, priorGroup));
+            }
+
+            // The destination buffer is expert-major. Counts from lower
+            // source ranks own the preceding rows within the same expert.
+            uint32_t dstRow = 0;
+            for (int32_t priorGroup = 0; priorGroup < groupIdx; ++priorGroup) {
+                for (int32_t srcRank = 0; srcRank < params.EP; ++srcRank) {
+                    dstRow += tokenPerExpert(tokenPerExpertLayout(
+                        srcRank, dstRank, priorGroup));
+                }
+            }
+            for (int32_t srcRank = 0; srcRank < params.rank; ++srcRank) {
+                dstRow += tokenPerExpert(tokenPerExpertLayout(
+                    srcRank, dstRank, groupIdx));
+            }
+
+            if (dstRow >= params.maxOutputSize) {
+                continue;
+            }
+            if (dstRow + rows > params.maxOutputSize) {
+                rows = params.maxOutputSize - dstRow;
+            }
+
+            AscendC::GlobalTensor<ElementA> gmRemoteDirect;
+            gmRemoteDirect.SetGlobalBuffer(reinterpret_cast<__gm__ ElementA *>(
+                shmem(peermemInfo.offsetDirectA, dstRank)));
+            CopyGMToGM(
+                gmRemoteDirect[dstRow * params.problemShape.k()],
+                gmLocalStaging[srcRow * params.problemShape.k()],
+                rows * params.problemShape.k(), params.ubMoveNum);
+        }
+
+        // All local producer cores finish their payload writes before one
+        // source-owned epoch publishes the entire sealed request. Keep this
+        // ingress generation independent from the existing egress barrier:
+        // reusing CrossRankSync's counter lets an empty destination rank enter
+        // the next phase while its peer is still consuming the prior phase.
+        AscendC::SyncAll<true>();
+        if (coreIdx == 0) {
+            __gm__ int32_t *localReady = reinterpret_cast<__gm__ int32_t *>(
+                shmem() + peermemInfo.offsetDirectIngressReady);
+            gm_dcci(localReady);
+            int32_t epoch = gm_load(localReady) + 1;
+            gm_store(localReady, epoch);
+            gm_dcci(localReady);
+
+            for (int32_t srcRank = 0; srcRank < params.EP; ++srcRank) {
+                __gm__ int32_t *remoteReady =
+                    reinterpret_cast<__gm__ int32_t *>(shmem(
+                        peermemInfo.offsetDirectIngressReady, srcRank));
+                // A peer may leave this barrier and publish the next wave
+                // while this rank is still checking the current one. Match
+                // CrossRankSync's one-generation look-ahead tolerance rather
+                // than waiting for an exact value that has already passed.
+                gm_signal_wait_until_eq_for_barrier(remoteReady, epoch);
+            }
+        }
+        AscendC::SyncAll<true>();
+
+        // The payload arrives through peer writes, while GMM1 subsequently
+        // consumes the local window through the Cube cache hierarchy. A rank
+        // barrier proves publication ordering but does not itself evict data
+        // cached by the preceding replay. Invalidate only the contiguous rows
+        // received by this rank before publishing AIV-to-AIC readiness;
+        // changing-route replay otherwise observes the previous wave.
+        int64_t receivedRows = 0;
+        for (int32_t groupIdx = 0; groupIdx < params.expertPerRank;
+             ++groupIdx) {
+            receivedRows += cumsumMM(
+                (params.EP - 1) * params.expertPerRank + groupIdx);
+        }
+        receivedRows = min(
+            receivedRows, static_cast<int64_t>(params.maxOutputSize));
+        const int64_t receivedBytes =
+            receivedRows * params.problemShape.k() * sizeof(ElementA);
+        for (int64_t byteOffset =
+                 static_cast<int64_t>(coreIdx) * AscendC::CACHE_LINE_SIZE;
+             byteOffset < receivedBytes;
+             byteOffset += static_cast<int64_t>(coreNum) *
+                           AscendC::CACHE_LINE_SIZE) {
+            gm_dcci(reinterpret_cast<__gm__ uint8_t *>(
+                shmem() + peermemInfo.offsetDirectA + byteOffset));
+        }
+        AscendC::SyncAll<true>();
+    }
+#endif
+
     CATLASS_DEVICE
     void UpdateAicFlags(const Params &params)
     {
@@ -860,6 +994,12 @@ private:
             prevSum = preSumBeforeRank(coreIdx * params.expertPerRank);
         }
         AscendC::SyncAll<true>();
+
+#ifdef DISPATCH_FFN_COMBINE_DIRECT_INGRESS
+        if (peermemInfo.directIngressEnabled) {
+            PushDirectIngress(params);
+        }
+#endif
         
         AscendC::GlobalTensor<int32_t> ExpertTokenNums;
         ExpertTokenNums.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t*>(params.ptrExpertTokenNums));
@@ -884,6 +1024,9 @@ private:
             } else if (prevGroupSum1 + scheduledM >= params.maxOutputSize) {
                 scheduledM = params.maxOutputSize - prevGroupSum1;
             }
+#ifdef DISPATCH_FFN_COMBINE_DIRECT_INGRESS
+            if (!peermemInfo.directIngressEnabled) {
+#endif
             for(int32_t dstEpIdx = coreIdx; dstEpIdx < params.EP; dstEpIdx += coreNum) {
                 uint32_t rowStart = (dstEpIdx == 0 ? 0 : cumsumMM((dstEpIdx - 1) * params.expertPerRank + groupIdx)) + prevGroupSum1;
                 if (rowStart < params.maxOutputSize) {
@@ -908,13 +1051,22 @@ private:
                     }
                 }
             }
+#ifdef DISPATCH_FFN_COMBINE_DIRECT_INGRESS
+            }
+#endif
             // The route counts are shared by every AIV core, so this branch is
             // uniform. An unscheduled expert has neither ingress writes nor an
             // AIC consumer: omit both its barrier and progress signal. The next
             // scheduled expert still synchronizes all producers before
             // publishing readiness.
             if (scheduledM > 0) {
+#ifdef DISPATCH_FFN_COMBINE_DIRECT_INGRESS
+                if (!peermemInfo.directIngressEnabled) {
+#endif
                 AscendC::SyncAll<true>();
+#ifdef DISPATCH_FFN_COMBINE_DIRECT_INGRESS
+                }
+#endif
                 AscendC::CrossCoreSetFlag<0x2, PIPE_MTE3>(
                     syncgmm1Idx / CROSS_CORE_FLAG_MAX_SET_COUNT);
                 syncgmm1Idx++;
@@ -1163,9 +1315,13 @@ private:
 
     struct PeermemInfo {
         int64_t offsetA;
+        int64_t offsetDirectA;
+        int64_t offsetDirectIngressReady;
+        int64_t directInputBytes;
         int64_t offsetPeerPerTokenScale;
         int64_t offsetPeerTokenPerExpert;
         int64_t offsetD;
+        bool directIngressEnabled;
 
         CATLASS_DEVICE
         PeermemInfo(){}
@@ -1176,6 +1332,48 @@ private:
             offsetPeerPerTokenScale = offsetA + AlignUp(shmem.SegmentSize() / 3, 512);
             offsetD = offsetPeerPerTokenScale + MB_SIZE;
             offsetPeerTokenPerExpert = shmem.SegmentSize() - 2 * MB_SIZE;
+            offsetDirectA = offsetD;
+            // Place the epoch immediately after the padded count matrix, on
+            // its own hardware cache line. The final rank barrier starts at
+            // segmentSize - 1 MiB, so the enable guard below fails closed if
+            // an unusually large expert topology exhausts this control gap.
+            const int64_t paddedExpertCount = AlignUp(
+                static_cast<int64_t>(params.EP) * params.expertPerRank + 1,
+                ALIGN_128);
+            const int64_t countMatrixBytes =
+                static_cast<int64_t>(params.EP) * paddedExpertCount *
+                sizeof(int32_t);
+            offsetDirectIngressReady = AlignUp(
+                offsetPeerTokenPerExpert + countMatrixBytes,
+                AscendC::CACHE_LINE_SIZE);
+            directInputBytes = 0;
+            directIngressEnabled = false;
+#ifdef DISPATCH_FFN_COMBINE_DIRECT_INGRESS
+            // maxOutputSize is a policy capacity (131072 in the production
+            // wrapper), not the number of rows this invocation can produce.
+            // Across EP sources, at most M * topK routes can arrive from each
+            // source, so size the peer buffer by that tighter graph-static
+            // bound. Using maxOutputSize here would disable the experiment in
+            // production even for tiny decode waves because the unused
+            // 131072-row reservation cannot fit in the peer segment.
+            const int64_t directInputRows = min(
+                static_cast<int64_t>(params.maxOutputSize),
+                static_cast<int64_t>(params.EP) * params.problemShape.m() *
+                    params.topK);
+            directInputBytes = AlignUp(
+                directInputRows * params.problemShape.k() * sizeof(ElementA),
+                512);
+            const int64_t returnBytes =
+                static_cast<int64_t>(params.problemShape.m()) * params.topK *
+                params.problemShape.k() * sizeof(ElementD2);
+            const int64_t directReturnOffset = offsetDirectA + directInputBytes;
+            if (directReturnOffset + returnBytes <= offsetPeerTokenPerExpert &&
+                offsetDirectIngressReady + AscendC::CACHE_LINE_SIZE <=
+                    shmem.SegmentSize() - MB_SIZE) {
+                offsetD = directReturnOffset;
+                directIngressEnabled = true;
+            }
+#endif
         }
     };
 
