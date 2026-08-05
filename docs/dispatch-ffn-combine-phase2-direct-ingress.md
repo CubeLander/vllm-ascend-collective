@@ -53,7 +53,10 @@ The count matrix and ingress epoch have disjoint, cache-line-aligned storage.
 The epoch is a source-owned unsigned 32-bit modular counter, independent of the
 existing egress completion state. A waiter accepts the requested epoch or one
 generation ahead, matching the existing barrier's bounded-skew rule and
-avoiding an exact-value ABA hang, including across `UINT32_MAX -> 0`.
+avoiding an exact-value ABA hang, including across `UINT32_MAX -> 0`. It may
+temporarily observe one generation behind while a peer publishes; any other
+modular distance traps immediately because the single payload buffer can no
+longer contain the requested wave.
 Every producer core completes its MTE3 payload writes with a DDR data-sync
 barrier before the local AIV join. The publishing core completes its scalar
 epoch store, and the receiving core orders completed epoch reads before local
@@ -241,10 +244,7 @@ production default because:
    not;
 2. the graph `active=1` selector is consistently faster, but its 4.34% median
    gain narrowly misses the preregistered 5% useful-effect target;
-3. the source-owned epoch assumes a fresh common initial generation and a
-   bounded one-wave skew; 2,048-generation communicator reuse and adversarial
-   unsigned wrap pass, but larger skew is outside the protocol;
-4. the dense count exchange remains, even though per-expert receiver pulls and
+3. the dense count exchange remains, even though per-expert receiver pulls and
    their barriers are gone.
 
 ### Visibility barrier closure
@@ -304,11 +304,17 @@ EP8 campaign with 64 experts per rank (512 global experts) also passed every
 route family and exact oracle, closing the previous above-256-expert gap on one
 node.
 
-The visibility gate is therefore closed for the single-node A2 candidate. The
-remaining promotion gates are multi-node topology coverage, the narrowly
-missed tiny-wave target, and the bounded one-wave epoch-skew assumption. Exact
-per-source cycle attribution could still sharpen the mechanism diagnosis, but
-the current Source product exposes visits rather than cycles.
+The visibility gate is therefore closed for the single-node A2 candidate. A
+disposable rank-0 fault injection then published two waves ahead: both ranks
+reported the expected AICore trap (`507015`) and the process exited nonzero
+instead of spinning. Restoring the ordinary object immediately passed a
+three-generation EP2 run. Larger epoch skew is consequently a fail-fast
+upstream-service error rather than a recovery protocol or promotion gate.
+
+The remaining promotion gates are multi-node topology coverage and the
+narrowly missed tiny-wave target. Exact per-source cycle attribution could
+still sharpen the mechanism diagnosis, but the current Source product exposes
+visits rather than cycles.
 
 [dcci-contract]: https://www.hiascend.com/document/detail/en/CANNCommunityEdition/900/API/ascendcopapi/atlasascendc_api_07_0177.html
 [datacopy-contract]: https://www.hiascend.com/document/detail/en/CANNCommunityEdition/900/API/ascendcopapi/atlasascendc_api_07_0103.html

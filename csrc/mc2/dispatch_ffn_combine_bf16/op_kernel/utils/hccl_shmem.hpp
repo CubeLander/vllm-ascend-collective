@@ -54,11 +54,17 @@ FORCE_INLINE_AICORE uint32_t gm_signal_wait_until_eq_for_barrier(
     __gm__ uint32_t *sig_addr, uint32_t cmp_val) {
     do {
         gm_dcci((__gm__ uint8_t *)sig_addr);
-        if (*sig_addr == cmp_val) {
-            return *sig_addr;
+        uint32_t observed = gm_load(sig_addr);
+        uint32_t distance = observed - cmp_val;
+        if (distance <= 1U) {
+            return observed;
         }
-        if (*sig_addr == cmp_val + 1U) {
-            return *sig_addr;
+        if (distance != UINT32_MAX) {
+            // A peer may be one wave behind before it publishes, or one wave
+            // ahead after it leaves the barrier. Any larger modular distance
+            // means ranks no longer agree on the payload generation; waiting
+            // cannot repair the overwritten single-buffer wave.
+            trap();
         }
     } while (true);
     return UINT32_MAX;

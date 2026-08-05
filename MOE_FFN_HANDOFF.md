@@ -125,6 +125,8 @@ The following are correctness constraints rather than tuning preferences:
 3. A waiter accepts the requested epoch or one generation ahead, matching the
    existing bounded-skew rule. Epochs are explicit unsigned 32-bit modular
    counters; a disposable `UINT32_MAX - 2` seed crossed wrap with exact output.
+   One generation behind is the only waitable state. Any other modular
+   distance traps because the requested single-buffer payload has been lost.
 4. Every producer core executes a DDR data-sync barrier before the local AIV
    join. The publisher completes its scalar epoch store, and the receiver
    executes a DDR data-sync barrier after observing every source epoch. Scalar
@@ -336,10 +338,10 @@ The known-good explicit-DSB selector objects are 605,560 bytes. Their hashes
 are:
 
 ```text
-23fb8f4853a54d1fc116ac58d15e27d7e148700e48dc5a9b751b56f8e2f11182
-64d3f9751ced90add45d1a34a0c961fb52c06863a25347cc8d147ecad79be908
-b7f63a16daa8f2589abd91b77699db0515aef067385bf0233ead8741c97833f8
-8e5e0d116153fe198f36bbaacfad12f538a6071ff7c0030be04f3dac08a7a3fa
+57245716904cf1708a65abd2f885afb497429c72bcd47119714c710da96c4c53
+f38dbeccc5a9594c89db7f94e97834cc6773757aed5ea30f31f53f126380f754
+01c8066cb0b573844a338b87772b5960709a316c327fb7ea63cefb77f0196834
+c26f3db0e533431dac8add91c62661719e37a8848b508d733f1ae4ebc3eeaab3
 ```
 
 Do not treat matching hashes as hardware validation; they only help detect a
@@ -377,12 +379,14 @@ Use this order so a failure has a small search space:
 6. Restore the release package, stop/remove only this task's container, and
    confirm the physical devices returned to their prior idle state.
 
-Promotion gates remain: multi-node topology coverage, the narrowly missed 5%
-tiny-wave target, and the bounded one-wave epoch-skew assumption. Single-node
-EP8 with 512 global experts passes, and the visibility gate is closed by
-explicit documented memory-completion barriers. The dense count exchange is
-still present and can be revisited later, but removing it is not part of the
-current closed optimization line.
+Promotion gates remain: multi-node topology coverage and the narrowly missed
+5% tiny-wave target. Single-node EP8 with 512 global experts passes, and the
+visibility gate is closed by explicit documented memory-completion barriers.
+A disposable two-wave skew injection produced an AICore trap (`507015`) and a
+nonzero process exit rather than a hang; the restored object then passed EP2.
+Larger skew is therefore fail-fast by design, not a recovery gate. The dense
+count exchange is still present and can be revisited later, but removing it is
+not part of the current closed optimization line.
 
 ## Why this host was abandoned
 
