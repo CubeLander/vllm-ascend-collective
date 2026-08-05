@@ -864,18 +864,29 @@ private:
                     }
                     uint32_t rowSrc = prevSum;
                     prevSum += rows;
-                    GM_ADDR otherRankPtr = shmem(0, dstEpIdx);
-                    AscendC::GlobalTensor<ElementA> gmRemoteA;
-                    gmRemoteA.SetGlobalBuffer(reinterpret_cast<__gm__ ElementA*>(otherRankPtr + peermemInfo.offsetA));
+                    if (rows > 0) {
+                        GM_ADDR otherRankPtr = shmem(0, dstEpIdx);
+                        AscendC::GlobalTensor<ElementA> gmRemoteA;
+                        gmRemoteA.SetGlobalBuffer(
+                            reinterpret_cast<__gm__ ElementA*>(otherRankPtr + peermemInfo.offsetA));
 
-                    MatrixCoord offsetA{rowStart, 0};
-                    MatrixCoord offsetPeer{rowSrc, 0};
-                    int64_t gmOffsetA = params.layoutA.GetOffset(offsetA);
-                    int64_t gmOffsetPeer = params.layoutA.GetOffset(offsetPeer);
-                    CopyGMToGM(gmA[gmOffsetA], gmRemoteA[gmOffsetPeer], rows * params.problemShape.k(), params.ubMoveNum);
+                        MatrixCoord offsetA{rowStart, 0};
+                        MatrixCoord offsetPeer{rowSrc, 0};
+                        int64_t gmOffsetA = params.layoutA.GetOffset(offsetA);
+                        int64_t gmOffsetPeer = params.layoutA.GetOffset(offsetPeer);
+                        CopyGMToGM(gmA[gmOffsetA], gmRemoteA[gmOffsetPeer],
+                                   rows * params.problemShape.k(), params.ubMoveNum);
+                    }
                 }
             }
-            AscendC::SyncAll<true>();
+            // The route counts are shared by every AIV core, so this branch is
+            // uniform.  An empty expert has no ingress writes to make visible;
+            // retain the AIV->AIC progress signal, but avoid a vacuous global
+            // barrier.  The next non-empty expert still synchronizes all of its
+            // producers before publishing readiness.
+            if (currentM > 0) {
+                AscendC::SyncAll<true>();
+            }
             AscendC::CrossCoreSetFlag<0x2, PIPE_MTE3>(syncgmm1Idx / CROSS_CORE_FLAG_MAX_SET_COUNT);
             syncgmm1Idx ++;
 

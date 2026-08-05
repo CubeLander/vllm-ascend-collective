@@ -1,6 +1,8 @@
 # Dispatch-FFN-Combine sparse-dataflow roadmap
 
-Status: design note; no implementation is authorized yet.
+Status: active experimental implementation. Phase 0 and the first bounded
+Phase 1 barrier-scope change are complete; see
+`dispatch-ffn-combine-phase0-measurements.md`.
 
 ## Objective
 
@@ -244,6 +246,11 @@ recorded.
 
 ### Phase 0: measurement and protocol accounting
 
+Status: complete for the synthetic EP2 matrix. The experiment identified the
+per-local-expert AIV barrier loop as a material fixed cost. Production route
+distributions and byte counters remain future evidence, not blockers for the
+bounded Phase 1 change.
+
 - Add experimental, removable phase timestamps/counters around routing,
   metadata/count exchange, ingress movement, expert compute, result movement,
   completion, and unpermute.
@@ -262,6 +269,11 @@ phase evidence.  Do not redesign blindly if instrumentation contradicts the
 source-derived hypothesis.
 
 ### Phase 1: compact active-expert execution
+
+Status: in progress. Empty source fragments no longer enter the copy helper,
+and empty local experts no longer execute a vacuous all-AIV barrier. AIC still
+iterates all expert slots and the AIV-to-AIC flag count is unchanged, so a
+true compact worklist remains to be implemented and measured.
 
 - Retain the existing metadata/count exchange and memory ownership.
 - Materialize a compact active-expert worklist.
