@@ -77,11 +77,13 @@ per-token/status flags, and explicitly cleans or advances protocol state.
 The inspected public host API exposes `HcclBatchPut` and `HcclBatchGet`, while
 the inspected symmetric-window API exposes peer-pointer lookup. Neither
 header documents a device-side `put-with-signal` operation or its memory
-ordering. The installed device kernels consequently remain the stronger
-nearby evidence: they use ordered payload/flag writes, explicit pipeline
-events, cache maintenance, polling, and double-buffered state. This does not
-prove that a narrower HCCL primitive is unavailable elsewhere; it means the
-redesign must not assume one until its contract is found or tested.
+ordering. The official `BatchWrite` documentation is also explicit that
+`Wait(handle)` proves local send completion, not peer receipt. The installed
+device kernels consequently remain the stronger nearby evidence: they use
+ordered payload/flag writes, explicit pipeline events, cache maintenance,
+polling, and double-buffered state. This does not prove that a narrower HCCL
+primitive is unavailable elsewhere; it means the redesign must not assume one
+until its contract is found or tested.
 
 ## DeepEP protocols
 
@@ -174,6 +176,8 @@ Primary references:
   <https://docs.nvidia.com/nvshmem/api/gen/api/ordering.html>
 - NCCL device GIN:
   <https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/api/device_gin.html>
+- AscendC HCCL `BatchWrite`:
+  <https://www.hiascend.com/document/detail/en/canncommercial/850/API/ascendcopapi/atlasascendc_api_07_10132.html>
 - DeepEP repository:
   <https://github.com/deepseek-ai/DeepEP>
 - NCCL EP source:
