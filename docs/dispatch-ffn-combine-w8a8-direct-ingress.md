@@ -1,14 +1,14 @@
 # Dispatch-FFN-Combine W8A8 direct ingress
 
-Status: experimental compile-time prototype. Correctness passes on EP2, EP4,
-and EP8; a DeepSeek-V4-Flash W8A8 TP8/EP8 smoke run selected `FUSED_MC2` on
-all ranks and completed. Production-shaped operator measurements retain the
-direct path only where it shows a repeatable kernel-level benefit. Warmed
-layerwise eager and graph-replay measurements pass the Phase 2 mechanism gate.
-Fresh-server end-to-end brackets on the shared host are quantitatively
-inconclusive because enclosing baseline drift exceeds the expected effect;
-they pass as functional smoke but do not yet support making the prototype a
-production default.
+Status: accepted single-node compile-time mechanism. Correctness passes on
+EP2, EP4, and EP8; a DeepSeek-V4-Flash W8A8 TP8/EP8 smoke run selected
+`FUSED_MC2` on all ranks and completed. Production-shaped operator
+measurements retain the direct path only where it shows a repeatable
+kernel-level benefit. Warmed layerwise eager and graph-replay measurements
+pass the Phase 2 mechanism gate. Fresh-server end-to-end brackets on the
+shared host are quantitatively inconclusive because enclosing baseline drift
+exceeds the expected effect; they remain functional, warmup, and
+large-regression smoke rather than evidence against the layerwise win.
 
 The evaluated candidate defines both
 `DISPATCH_FFN_COMBINE_W8A8_DIRECT_INGRESS` and
@@ -40,6 +40,14 @@ The present evidence satisfies the layerwise mechanism criterion: EP8 exact
 layer, and graph replay median improves 1.53%. The decreasing magnitude is
 consistent with dilution by surrounding graph work rather than disappearance
 of the operator benefit.
+
+Mechanism acceptance and deployment scope are separate decisions. The current
+guards are compile time and do not prove a host predicate that restricts the
+protocol to one node. Single-node EP2, EP4, and EP8 are covered; multi-node EP
+is not. The rollout boundary is therefore a named single-node A2 candidate
+package, while unknown and multi-node topologies retain the macro-off package.
+This is an operability boundary, not a request for another shared-host
+end-to-end performance campaign.
 
 ## Purpose
 
@@ -111,6 +119,36 @@ rank publishes one preference bit in the count row's first padding lane. The
 existing tagged count exchange carries it for free, and every receiver takes
 an all-source AND over only `EP` integers. This uniform decision prevents peers
 from entering different protocols.
+
+## Reproducible opt-in package
+
+The repository's existing `--ops-compile-options` surface is sufficient; a
+second feature configuration mechanism is unnecessary. From the repository
+root, build the single-node candidate with:
+
+```bash
+bash csrc/build.sh \
+  --ops=dispatch_ffn_combine \
+  --soc=ascend910b \
+  --vendor_name=custom_transformer \
+  --pkg \
+  --ops-compile-options \
+  '-UDISPATCH_FFN_COMBINE_PROFILE;-DDISPATCH_FFN_COMBINE_W8A8_DIRECT_INGRESS;-DDISPATCH_FFN_COMBINE_W8A8_DIRECT_INGRESS_SPARSE_FALLBACK'
+```
+
+Do not trust an incremental build directory to identify the macro set.
+Generated operator files can retain earlier options. Every candidate receipt
+must record the source commit, dirty-worktree state, complete
+`OPS_COMPILE_OPTIONS`, generated `custom_compile_options.ini` row, and SHA-256
+hashes of all installed object variants. Build from a clean operator output or
+an isolated output directory.
+
+After installation, rerun EP2, EP4, and EP8 changing-generation correctness,
+the eager and graph selector-boundary cases with workload warmup, and the
+DeepSeek-V4-Flash semantic and short stability smoke. Canary only on a declared
+single-node A2 service pool. Rollback drains the canary, reinstalls the recorded
+macro-off package, verifies restored object hashes, and repeats the semantic
+smoke.
 
 ## Correctness and fault evidence
 
