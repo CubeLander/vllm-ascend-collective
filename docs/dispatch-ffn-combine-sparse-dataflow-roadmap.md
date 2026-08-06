@@ -5,9 +5,11 @@ sparse-schedule changes, and the single-node Phase 2 direct-ingress mechanism
 are complete. Phase 3 proved correct at EP2 but is closed because its eager
 gain did not survive warmed graph replay. It will not be generalized to EP4 or
 EP8. Phase 4 is the next possible discriminator, after its egress dependency
-and measurement are isolated. See `dispatch-ffn-combine-phase0-measurements.md`,
-`dispatch-ffn-combine-phase2-direct-ingress.md`, and
-`dispatch-ffn-combine-phase3-ep2-readiness.md`.
+and measurement are isolated. See
+`dispatch-ffn-combine-phase0-measurements.md`,
+`dispatch-ffn-combine-phase2-direct-ingress.md`,
+`dispatch-ffn-combine-phase3-ep2-readiness.md`, and
+`dispatch-ffn-combine-phase4-ep2-egress.md`.
 
 ## Operating rule: prove the micro-logic before the collective
 
@@ -414,7 +416,9 @@ Status: next possible discriminator, not yet implemented. Before changing the
 protocol, identify the exact egress wait on the warmed EP2 critical path and
 preregister one dependency-removal hypothesis. Keep ingress, expert compute,
 and output layout fixed; begin with a two-rank micro-logic prototype and stop
-before generic completion state if eager and graph replay do not both win.
+before generic completion state if eager and graph replay do not both win. The
+preregistered local-only completion-cost ceiling is in
+`dispatch-ffn-combine-phase4-ep2-egress.md`.
 
 - Retain and document the current source-owned `offsetD` return placement;
   verify its exact `(token, top-k slot)` identity contract.
