@@ -163,6 +163,35 @@ all outputs exact. This is baseline parity, not a direct-ingress speedup.
 
 These are operator microbenchmarks, not an end-to-end model throughput claim.
 
+## Profiler evidence and rejected prefix candidate
+
+A one-wave torch-NPU Level1 collection profiled rank 0 while every peer still
+participated in a fresh process group. It is mechanism evidence rather than a
+distributed critical-path measurement:
+
+| Shape | Kernel duration | AIC MAC | AIC scalar | AIC MTE2 | AIV scalar |
+|---|---:|---:|---:|---:|---:|
+| EP4 graph `M=32`, active 2 | 251.19 us | 2.9% | 41.4% | 14.6% | 33.6% |
+| EP8 exact `M=8` | 225.07 us | 5.4% | 33.0% | 31.8% | 29.0% |
+
+The surviving paths are control/scalar-heavy rather than MAC- or payload-
+bandwidth-bound. EP8 also carries material MTE2 pressure. Further work should
+therefore attribute waits and scalar control before changing copy granularity.
+
+A disposable candidate replaced on-demand nested prefix calculation with
+contiguous per-core expert blocks and incrementally advanced prefixes. It
+passed the full EP2/EP4/EP8 exact-output suite, but a
+candidate/baseline/candidate bracket rejected it:
+
+| Shape | Candidate 1 | Baseline | Candidate 2 | Candidate regression |
+|---|---:|---:|---:|---:|
+| EP8 exact `M=8` | 460.16 us | 391.27 us | 418.39 us | 10.9% |
+| EP4 graph active 2 | 469.09 us | 438.53 us | 484.27 us | 8.0% |
+
+The dense prefix preparation does work for empty targets and gives up the
+cyclic expert distribution. It is not present in tracked source. Do not replace
+sparse on-demand prefix calculation with this form of dense per-core scan.
+
 ## Real-model EP8 smoke
 
 DeepSeek-V4-Flash W8A8 was started at TP8/EP8 with the production fused-MC2
@@ -196,8 +225,8 @@ system vendor configuration is not readable by the workspace user.
 
 The remaining promotion gates are:
 
-1. profile the surviving EP4 graph and EP8 exact `M >= 8` direct paths before
-   changing scheduling or copy granularity;
+1. source-attribute the remaining wait/scalar control only if another kernel
+   optimization is pursued; the first dense-prefix candidate is closed;
 2. run a controlled end-to-end A/B only if the promotion decision needs a
    costly fresh-server throughput campaign;
 3. decide whether to upstream the compile-time policy as-is or first expose it
