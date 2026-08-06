@@ -248,6 +248,50 @@ speedup, with a possible small saturated regression. The approximately 4%
 EP8 `M=8` isolated-kernel win does not currently justify enabling this path in
 a production model build.
 
+## Warmed real-model msprof comparison
+
+The end-to-end result was followed by matched dynamic `msprof` collections on
+rank 0. Candidate and baseline each used a fresh server, the same semantic and
+16-request burst warmup, and four excluded benchmark warmups. After attaching,
+an additional start/stop window primed the profiler itself; only the second
+start/stop window was interpreted. This avoids attributing `msprof`'s first-task
+overhead to either operator.
+
+The captured request produced 43 fused calls at each of `M=64`, `M=1`, and
+`M=449`, followed by 215 calls at `M=8` and 86 at `M=7`. Server logs
+independently confirmed the same shape sequence. The candidate takes direct
+ingress at `M=64`, `M=449`, and `M=8`, and gather fallback at `M=1` and `M=7`.
+
+| Shape | Baseline mean | Candidate mean | Mean improvement | Median improvement | P95 improvement |
+|---:|---:|---:|---:|---:|---:|
+| `M=1` | 182.02 us | 181.73 us | 0.16% | 0.28% | 0.45% |
+| `M=7` | 205.14 us | 205.66 us | -0.25% | -0.26% | 0.48% |
+| `M=8` | 207.18 us | 201.88 us | 2.56% | 2.38% | 4.67% |
+| `M=64` | 829.44 us | 359.04 us | 56.71% | 3.09% | 74.13% |
+| `M=449` | 572.69 us | 566.07 us | 1.16% | 1.79% | 1.16% |
+
+The `M=64` mean and P95 are dominated by a baseline-only transient in the first
+12 layers, including one 4.73 ms call. Its 3.09% median delta is the defensible
+steady comparison; the large tail reduction is an observation to reproduce,
+not a promotion claim. The fallback shapes are at parity, while warmed `M=8`
+direct ingress improves mean, median, and P95. The large prefill wave is also
+slightly positive rather than revealing the suspected large-wave regression.
+
+Across the 215 warmed `M=8` candidate calls, duration was 201.88 us mean,
+199.76 us median, and 224.77 us P95. The average utilization signature was
+4.1% AIC MAC, 33.6% AIC scalar, 26.5% AIC MTE2, and 29.7% AIV scalar,
+consistent with the earlier one-wave profile. `DispatchFFNCombine` accounted
+for 28.0% of summed device task time in the target window and remained its
+largest operator.
+
+The profiled eight-request workload itself was effectively tied: candidate
+output throughput was 13.53 tokens/s versus 13.47 for baseline, and mean TPOT
+was 451.38 ms versus 455.70 ms. Profiling overhead and the small request count
+make these mechanism checks rather than throughput evidence. They do show that
+the warmed rank-0 kernel does not explain the earlier end-to-end regression;
+the remaining possibilities are cross-rank critical-path behavior and ordinary
+fresh-server variance.
+
 ## Build discipline and remaining gates
 
 Build the candidate by adding both macros to `OPS_COMPILE_OPTIONS`. A clean
@@ -268,7 +312,8 @@ The remaining promotion gates are:
 1. source-attribute the remaining wait/scalar control only if another kernel
    optimization is pursued; the first dense-prefix candidate is closed;
 2. explain or remove the saturated TP8/EP8 model-level gap before promotion;
-   if measurement is repeated, use enough interleaved fresh-server legs to
+   rank-0 `msprof` does not reproduce a kernel regression, so any repeat should
+   use enough interleaved fresh-server legs or cross-rank evidence to
    distinguish a sub-3% effect from baseline drift;
 3. preserve the current compile-time opt-in until end-to-end evidence supports
    a production default, then decide whether to upstream the policy as-is or
