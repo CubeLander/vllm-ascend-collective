@@ -3,7 +3,9 @@
 Status: experimental compile-time prototype. Correctness passes on EP2, EP4,
 and EP8; a DeepSeek-V4-Flash W8A8 TP8/EP8 smoke run selected `FUSED_MC2` on
 all ranks and completed. Production-shaped operator measurements retain the
-direct path only where it shows a repeatable benefit.
+direct path only where it shows a repeatable kernel-level benefit. A strict
+fresh-server end-to-end bracket did not reproduce that benefit at TP8/EP8, so
+the prototype is not yet supported for production promotion.
 
 The evaluated candidate defines both
 `DISPATCH_FFN_COMBINE_W8A8_DIRECT_INGRESS` and
@@ -208,6 +210,44 @@ extension binary. With that bounded runtime composition:
 The smoke observed 8.59 output tokens/s and 624.74 ms mean TPOT, but it was not
 an A/B run and is evidence only for real-model correctness and selectability.
 
+## Real-model end-to-end bracket
+
+A subsequent baseline/candidate/baseline bracket used the same packed-KV
+DeepSeek-V4-Flash W8A8 runtime and a fresh server for each leg. Every server
+first completed a semantic request. Each workload then ran 16 same-shape
+requests plus two benchmark-internal warmups, all excluded from measurement,
+before 32 measured requests with four further benchmark-internal warmups.
+Inputs were 64 tokens, outputs were 16 tokens, and prefix caching was disabled.
+The two measured workloads were arrival rate 2 and an unbounded burst with up
+to eight concurrent sequences.
+
+All three legs selected `FUSED_MC2`, returned the same semantic continuation,
+completed every request, shut down cleanly, and left all eight devices idle.
+The baseline object hashes matched across both baseline legs, and the cleanup
+trap restored the final candidate hashes. The burst produced exact `M=8`
+fused calls, so it exercised EP8 direct ingress rather than only its fallback.
+
+The primary comparison is the candidate against the mean of the two enclosing
+baselines:
+
+| Workload | Metric | Baseline 1 | Candidate | Baseline 2 | Improvement | Baseline drift |
+|---|---|---:|---:|---:|---:|---:|
+| arrival rate 2 | output throughput | 15.57 tok/s | 15.90 tok/s | 16.02 tok/s | +0.70% | +2.89% |
+| arrival rate 2 | mean TPOT | 425.35 ms | 415.66 ms | 413.25 ms | +0.87% | -2.84% |
+| arrival rate 2 | mean E2EL | 12359.17 ms | 11916.52 ms | 11770.25 ms | +1.23% | -4.77% |
+| burst | output throughput | 19.43 tok/s | 18.95 tok/s | 19.18 tok/s | -1.82% | -1.26% |
+| burst | mean TPOT | 366.95 ms | 383.26 ms | 378.77 ms | -2.79% | +3.22% |
+| burst | mean E2EL | 16645.37 ms | 16830.80 ms | 16637.69 ms | -1.14% | -0.05% |
+
+Positive improvement means higher throughput or lower latency. The low-load
+differences are smaller than the baseline drift and establish parity, not a
+gain. In the saturated workload the candidate is below both baselines on
+throughput and TPOT, but the 1.8--2.8% deltas are comparable to run-to-run
+variation. The honest conclusion is therefore no demonstrated end-to-end
+speedup, with a possible small saturated regression. The approximately 4%
+EP8 `M=8` isolated-kernel win does not currently justify enabling this path in
+a production model build.
+
 ## Build discipline and remaining gates
 
 Build the candidate by adding both macros to `OPS_COMPILE_OPTIONS`. A clean
@@ -227,7 +267,9 @@ The remaining promotion gates are:
 
 1. source-attribute the remaining wait/scalar control only if another kernel
    optimization is pursued; the first dense-prefix candidate is closed;
-2. run a controlled end-to-end A/B only if the promotion decision needs a
-   costly fresh-server throughput campaign;
-3. decide whether to upstream the compile-time policy as-is or first expose it
-   through the operator build configuration.
+2. explain or remove the saturated TP8/EP8 model-level gap before promotion;
+   if measurement is repeated, use enough interleaved fresh-server legs to
+   distinguish a sub-3% effect from baseline drift;
+3. preserve the current compile-time opt-in until end-to-end evidence supports
+   a production default, then decide whether to upstream the policy as-is or
+   expose it through the operator build configuration.
