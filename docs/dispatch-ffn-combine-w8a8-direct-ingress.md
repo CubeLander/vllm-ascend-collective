@@ -195,6 +195,15 @@ The dense prefix preparation does work for empty targets and gives up the
 cyclic expert distribution. It is not present in tracked source. Do not replace
 sparse on-demand prefix calculation with this form of dense per-core scan.
 
+A second disposable candidate removed the logically redundant observation of
+the publishing rank's own epoch. The local producer barrier already precedes
+publication, so EP2/EP4/EP8 correctness still passed. Performance did not: a
+candidate/v6/candidate EP8 exact-`M=8` bracket measured 425.04, 388.87, and
+413.17 us, and the paired candidate median regressed v6 by 7.63%. The self poll
+is therefore retained; its position in the ordered polling loop appears to
+provide useful pacing or instruction-layout behavior that the source-level
+invariant alone does not predict.
+
 ## Real-model EP8 smoke
 
 DeepSeek-V4-Flash W8A8 was started at TP8/EP8 with the production fused-MC2
@@ -425,8 +434,9 @@ system vendor configuration is not readable by the workspace user.
 
 The remaining engineering gates are:
 
-1. source-attribute the remaining wait/scalar control only if another kernel
-   optimization is pursued; the first dense-prefix candidate is closed;
+1. source-attribute the remaining wait/scalar control before another kernel
+   optimization; both dense-prefix preparation and self-epoch-poll removal are
+   now closed by regressions;
 2. treat the fresh-server graph promotion gate as completed but not passed;
    two brackets disagree and their enclosing baseline drift is larger than the
    expected service-level effect;
