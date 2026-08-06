@@ -214,7 +214,9 @@ an A/B run and is evidence only for real-model correctness and selectability.
 
 A subsequent baseline/candidate/baseline bracket used the same packed-KV
 DeepSeek-V4-Flash W8A8 runtime and a fresh server for each leg. Every server
-first completed a semantic request. Each workload then ran 16 same-shape
+was launched with `--enforce-eager`, so this bracket covers the mixed/eager
+path rather than ACLGraph decode. Every server first completed a semantic
+request. Each workload then ran 16 same-shape
 requests plus two benchmark-internal warmups, all excluded from measurement,
 before 32 measured requests with four further benchmark-internal warmups.
 Inputs were 64 tokens, outputs were 16 tokens, and prefix caching was disabled.
@@ -292,6 +294,66 @@ the warmed rank-0 kernel does not explain the earlier end-to-end regression;
 the remaining possibilities are cross-rank critical-path behavior and ordinary
 fresh-server variance.
 
+## Graph-enabled TraceLoom comparison
+
+The repository's TraceLoom submodule was advanced to `d059b0b`, built from
+source, and passed all 50 enabled native tests; 11 fixture-dependent tests were
+disabled because their external assets are not present. The two warmed eager
+profiles above contain no ACLGraph capture or replay evidence, as expected
+from `--enforce-eager`. They remain the strict eager control.
+
+A new matched candidate/baseline collection removed `--enforce-eager` and used
+`FULL_DECODE_ONLY` with capture size 8. Dynamic `msprof` attached to rank 0
+before graph capture, then retained capture, a semantic request, the same-shape
+warmup, and a formal eight-request by eight-output burst in one clock domain.
+Both runs completed, restored the candidate objects, and left all eight devices
+idle. Server logs independently showed eager prefill and `FULL` decode at
+eight tokens and eight requests.
+
+TraceLoom isolated the formal tail as seven replay iterations. Every replay
+enclosed exactly 43 `DispatchFFNCombine` calls, matching the model's 43 MoE
+layers:
+
+| Formal graph metric | Baseline | Candidate | Candidate latency reduction |
+|---|---:|---:|---:|
+| complete decode-loop average | 51.95 ms | 51.26 ms | 1.32% |
+| graph replay median | 38.70 ms | 38.11 ms | 1.53% |
+| graph replay mean | 39.44 ms | 38.09 ms | 3.42% |
+| `DispatchFFNCombine` mean per layer | 212.69 us | 204.94 us | 3.64% |
+
+The baseline replay mean contains one 44.67 ms outlier. The 1.53% replay
+median and 1.32% complete-loop reduction are therefore the robust graph
+results. The operator saves about 333 us of summed device task duration per
+replay; the complete graph saves about 686 us per iteration. This is direct
+evidence that the operator win survives inside the decode graph rather than
+being erased by neighboring work.
+
+The same TraceLoom profile separates the two formal graph-external eager
+waves. Median operator duration avoids the known first-layer transient:
+
+| Eager wave | Baseline DFC median | Candidate DFC median | DFC reduction | Baseline DFC span | Candidate DFC span | Span reduction |
+|---|---:|---:|---:|---:|---:|---:|
+| `M=64` | 359.05 us | 346.77 us | 3.42% | 428.71 ms | 439.24 ms | -2.46% |
+| `M=449` | 584.91 us | 572.69 us | 2.09% | 676.52 ms | 655.94 ms | 3.04% |
+
+`M=64` again improves inside the operator but does not shorten its complete
+DFC-to-DFC wave in this single pair, so no prefill claim is made from it.
+`M=449` is directionally consistent at both levels.
+
+The profiled request result agrees with the graph loop rather than the earlier
+eager-only saturated bracket: candidate request throughput was 4.951 versus
+4.882 requests/s (+1.41%), mean TTFT was 1164.00 versus 1179.63 ms (-1.33%),
+and mean TPOT was 62.44 versus 63.37 ms (-1.46%). This is one candidate/baseline
+pair under profiling, not yet a fresh-server B/C/B promotion result.
+
+TraceLoom found 69 ACLGraph envelopes in each complete collection but promoted
+zero exact replay compositions. Candidate had 10 and baseline one
+`unrecognized_body_mismatch` regions, so the capability state is
+`evidence_incomplete`; the report used legacy device replay envelopes. The
+formal envelopes are nevertheless internally aligned, contain exactly 43 DFC
+children each, and agree with server logs and request-level timing. Treat them
+as strong paired mechanism evidence, not exact capture-body proof.
+
 ## Build discipline and remaining gates
 
 Build the candidate by adding both macros to `OPS_COMPILE_OPTIONS`. A clean
@@ -311,10 +373,14 @@ The remaining promotion gates are:
 
 1. source-attribute the remaining wait/scalar control only if another kernel
    optimization is pursued; the first dense-prefix candidate is closed;
-2. explain or remove the saturated TP8/EP8 model-level gap before promotion;
-   rank-0 `msprof` does not reproduce a kernel regression, so any repeat should
-   use enough interleaved fresh-server legs or cross-rank evidence to
-   distinguish a sub-3% effect from baseline drift;
-3. preserve the current compile-time opt-in until end-to-end evidence supports
+2. rerun the production graph-enabled workload as a fresh-server
+   baseline/candidate/baseline bracket without profiler overhead. The current
+   graph pair is positive and explains the eager/graph distinction, but a
+   roughly 1.4% request-level effect still needs an enclosing baseline to
+   distinguish it from server drift;
+3. resolve TraceLoom's exact-composition body mismatch only if exact graph-body
+   attribution or a cross-rank critical-path claim becomes necessary; the
+   aligned legacy envelopes are sufficient for the present mechanism result;
+4. preserve the current compile-time opt-in until end-to-end evidence supports
    a production default, then decide whether to upstream the policy as-is or
    expose it through the operator build configuration.
