@@ -304,6 +304,40 @@ the warmed rank-0 kernel does not explain the earlier end-to-end regression;
 the remaining possibilities are cross-rank critical-path behavior and ordinary
 fresh-server variance.
 
+## Cross-rank msopprof attribution
+
+An eight-rank exact-`M=8` application-replay `msopprof` collection added source
+and pipeline evidence. Source mode placed the highest dynamic basic-block
+counts in the routing quantizer, around the temporary smooth-input allocation,
+before direct ingress begins. Direct-ingress source lines themselves had only
+static execution counts. These counts are instrumented frequencies rather than
+time, so they locate executed work but cannot time the hardware epoch wait.
+
+Pipeline mode showed a different and more useful invariant. Across ranks, the
+active AIC scalar envelope was about 63--78 us, AIV scalar 60--72 us, MTE1
+27--45 us, MTE2 60--107 us, and MTE3 2.7--5.0 us. Instrumented task durations
+ranged from 201 us to 20.2 ms even though those active envelopes remained
+small. Absolute per-rank task duration is distorted by profiling and the
+wait-ID counters accumulate with tool-specific semantics, but the stable
+active work inside much larger tasks supports a synchronization/communication
+critical path rather than an arithmetic bottleneck.
+
+`TimelineDetail` cannot close this gap in application replay: this CANN build
+accepts it only with kernel replay, while replaying one distributed
+communication kernel outside its coordinated eight-rank execution is unsafe
+and non-representative. This is a tool boundary, not evidence for a particular
+epoch implementation.
+
+The most direct follow-up was tested rather than inferred. A disposable
+notification-array candidate made each source push its epoch into a
+cache-line-separated slot in every destination window, then made each receiver
+poll only local HBM. It preserved the existing modular fail-fast gate and
+passed an EP8 exact-`M=8` smoke run. In a candidate/v6/candidate bracket its
+paired median was 462.76 us versus 417.83 us for v6, a 10.75% regression; P90
+regressed 25.23%. The extra remote stores and DCCI publication cost more than
+the removed remote polling. Keep the source-owned remote-read protocol and do
+not pursue another scalar barrier rewrite without stronger timing evidence.
+
 ## Graph-enabled TraceLoom comparison
 
 The repository's TraceLoom submodule was advanced to `d059b0b`, built from
@@ -434,9 +468,10 @@ system vendor configuration is not readable by the workspace user.
 
 The remaining engineering gates are:
 
-1. source-attribute the remaining wait/scalar control before another kernel
-   optimization; both dense-prefix preparation and self-epoch-poll removal are
-   now closed by regressions;
+1. treat scalar epoch-protocol tuning as closed for the current design: source
+   mode cannot time the wait, pipeline mode identifies synchronization and
+   communication as the broad residual, and dense-prefix preparation,
+   self-epoch-poll removal, and local-poll notification all regress;
 2. treat the fresh-server graph promotion gate as completed but not passed;
    two brackets disagree and their enclosing baseline drift is larger than the
    expected service-level effect;
