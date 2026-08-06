@@ -90,7 +90,7 @@ bash csrc/build.sh \
   --vendor_name=custom_transformer \
   --pkg \
   --ops-compile-options \
-  '-UDISPATCH_FFN_COMBINE_PROFILE;-DDISPATCH_FFN_COMBINE_W8A8_DIRECT_INGRESS;-DDISPATCH_FFN_COMBINE_W8A8_DIRECT_INGRESS_SPARSE_FALLBACK'
+  '-DDISPATCH_FFN_COMBINE_W8A8_DIRECT_INGRESS;-DDISPATCH_FFN_COMBINE_W8A8_DIRECT_INGRESS_SPARSE_FALLBACK'
 ```
 
 The build directory is not a source of truth. Incremental CMake and generated
