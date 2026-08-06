@@ -195,3 +195,10 @@ def test_dispatch_ffn_combine_w8a8_two_ranks():
     world_size = 2
     port = 29501 + random.randint(0, 10000)
     mp.spawn(_run_rank, args=(world_size, port), nprocs=world_size, join=True)
+
+
+@torch.inference_mode()
+def test_dispatch_ffn_combine_w8a8_four_ranks():
+    world_size = 4
+    port = 29501 + random.randint(0, 10000)
+    mp.spawn(_run_rank, args=(world_size, port), nprocs=world_size, join=True)

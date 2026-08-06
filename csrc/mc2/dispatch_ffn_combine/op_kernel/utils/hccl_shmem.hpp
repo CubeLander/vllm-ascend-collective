@@ -50,17 +50,20 @@ FORCE_INLINE_AICORE void gm_dcci(__gm__ T * addr) {
     __asm__ __volatile__("");
 }
 
-FORCE_INLINE_AICORE int32_t gm_signal_wait_until_eq_for_barrier(__gm__ int32_t *sig_addr, int32_t cmp_val) {
+FORCE_INLINE_AICORE uint32_t gm_signal_wait_until_eq_for_barrier(
+    __gm__ uint32_t *sig_addr, uint32_t cmp_val) {
     do {
         gm_dcci((__gm__ uint8_t *)sig_addr);
-        if (*sig_addr == cmp_val) {
-            return *sig_addr;
+        uint32_t observed = gm_load(sig_addr);
+        uint32_t distance = observed - cmp_val;
+        if (distance <= 1U) {
+            return observed;
         }
-        if (*sig_addr == cmp_val + 1) {
-            return *sig_addr;
+        if (distance != UINT32_MAX) {
+            trap();
         }
     } while (true);
-    return -1;
+    return UINT32_MAX;
 }
 
 FORCE_INLINE_AICORE void gm_signal_wait_until_ne(__gm__ int32_t *sig_addr, int32_t cmp_val) {
@@ -171,13 +174,13 @@ public:
     FORCE_INLINE_AICORE
     void CrossRankSync() {
         uint64_t flag_offset = (m_segmentSize - MB_SIZE) / sizeof(int32_t);
-        __gm__ int32_t* sync_counter = (__gm__ int32_t*)(*this)() + flag_offset;
-        __gm__ int32_t* sync_base = (__gm__ int32_t*)(*this)() + flag_offset + 2048;
-        int count = gm_load(sync_base) + 1;
+        __gm__ uint32_t* sync_counter = (__gm__ uint32_t*)(*this)() + flag_offset;
+        __gm__ uint32_t* sync_base = (__gm__ uint32_t*)(*this)() + flag_offset + 2048;
+        uint32_t count = gm_load(sync_base) + 1U;
         int vec_id = AscendC::GetBlockIdx();
         int vec_size = AscendC::GetBlockNum() * AscendC::GetTaskRation();
         for(int i = vec_id; i < m_rankSize; i += vec_size) {
-            __gm__ int32_t* sync_remote = (__gm__ int32_t*)((*this)(i)) + flag_offset + m_rank * 16;
+            __gm__ uint32_t* sync_remote = (__gm__ uint32_t*)((*this)(i)) + flag_offset + m_rank * 16;
             gm_store(sync_remote, count);
             gm_dcci((__gm__ uint8_t*)sync_remote);
             auto sync_check = sync_counter + i * 16;

@@ -22,6 +22,11 @@
 #include "catlass/matrix_coord.hpp"
 #include "catlass/epilogue/tile/tile_copy.hpp"
 
+#if defined(DISPATCH_FFN_COMBINE_W8A8_DIRECT_INGRESS_SPARSE_FALLBACK) && \
+    !defined(DISPATCH_FFN_COMBINE_W8A8_DIRECT_INGRESS)
+#error "W8A8 direct-ingress sparse fallback requires direct ingress"
+#endif
+
 #ifndef HCCL_COMM
     #include "block_mmad_preload_async_fixpipe_quant.hpp"
     #include "copy_gm_to_l1_custom.hpp"
@@ -248,11 +253,26 @@ private:
         workspaceInfo = WorkspaceInfo(params);
         peermemInfo = PeermemInfo(params, shmem);
         cumsumMM.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t*>(workspaceInfo.ptrcumsumMM));
+#ifdef DISPATCH_FFN_COMBINE_W8A8_DIRECT_INGRESS
+        if (peermemInfo.directIngressEnabled) {
+            gmA.SetGlobalBuffer(reinterpret_cast<__gm__ ElementA *>(
+                shmem() + peermemInfo.offsetDirectA));
+            gmPerTokenScale1.SetGlobalBuffer(
+                reinterpret_cast<__gm__ ElementPerTokenScale *>(
+                    shmem() + peermemInfo.offsetDirectScale));
+        } else {
+            gmA.SetGlobalBuffer(reinterpret_cast<__gm__ ElementA *>(workspaceInfo.ptrA));
+            gmPerTokenScale1.SetGlobalBuffer(
+                reinterpret_cast<__gm__ ElementPerTokenScale *>(
+                    workspaceInfo.ptrPerTokenScale));
+        }
+#else
         gmA.SetGlobalBuffer(reinterpret_cast<__gm__ ElementA *>(workspaceInfo.ptrA));
+        gmPerTokenScale1.SetGlobalBuffer(reinterpret_cast<__gm__ ElementPerTokenScale *>(workspaceInfo.ptrPerTokenScale));
+#endif
         gmC.SetGlobalBuffer(reinterpret_cast<__gm__ ElementC *>(workspaceInfo.ptrC));
         gmPermutedToken.SetGlobalBuffer(reinterpret_cast<__gm__ ElementD1 *>(workspaceInfo.ptrPermutedToken));
         gmC2.SetGlobalBuffer(reinterpret_cast<__gm__ ElementC *>(workspaceInfo.ptrC2));
-        gmPerTokenScale1.SetGlobalBuffer(reinterpret_cast<__gm__ ElementPerTokenScale *>(workspaceInfo.ptrPerTokenScale));
         gmPerTokenScale2.SetGlobalBuffer(reinterpret_cast<__gm__ ElementPerTokenScale *>(workspaceInfo.ptrPerTokenScale2));
         tokenPerExpert.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t *>(shmem() + peermemInfo.offsetPeerTokenPerExpert));
         paddedExpertNumAligned = AlignUp(params.EP * params.expertPerRank + 1, ALIGN_128);
@@ -368,12 +388,37 @@ private:
 
     CATLASS_DEVICE
     void ApplyXActiveMask(Params const &params) {
-        if (params.ptrXActiveMask == nullptr) {
-            return;
-        }
         int32_t m = params.problemShape.m();
         int32_t topK = params.topK;
         int32_t expertNum = params.expertPerRank * params.EP;
+
+#ifdef DISPATCH_FFN_COMBINE_W8A8_DIRECT_INGRESS_SPARSE_FALLBACK
+        // Reuse the count row's padding lane to publish a uniform protocol
+        // preference. The tagged count exchange already transports this lane,
+        // so selection adds no communication round or matrix scan.
+        if (coreIdx == 0 && peermemInfo.directIngressEnabled) {
+            int32_t preferDirect = 1;
+            // W8A8's existing per-expert gather overlaps ingress with GMM1,
+            // so sealing a whole wave does not amortize at the 1-2 token
+            // floor. A prefix-valid graph mask uses lane one to expose the
+            // same floor even when M is padded.
+            if (m <= 2 ||
+                (params.ptrXActiveMask != nullptr && !gm_load(
+                    reinterpret_cast<__gm__ bool *>(params.ptrXActiveMask) + 1))) {
+                preferDirect = 0;
+            }
+            const int64_t preferenceOffset =
+                tokenPerExpertLayout(params.rank, 0, expertNum);
+            tokenPerExpert.SetValue(preferenceOffset, preferDirect);
+            DataCacheCleanAndInvalid<
+                int32_t, CacheLine::SINGLE_CACHE_LINE,
+                DcciDst::CACHELINE_OUT>(tokenPerExpert[preferenceOffset]);
+        }
+#endif
+
+        if (params.ptrXActiveMask == nullptr) {
+            return;
+        }
         AscendC::GlobalTensor<int32_t> expertIdxGm;
         expertIdxGm.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t*>(params.expertIdx));
 
@@ -387,26 +432,47 @@ private:
         AscendC::LocalTensor<int32_t> tmpExpertIdx = resource.ubBuf.template GetBufferByByte<int32_t>(0);
         int32_t copySize = endIdx - startIdx;
 
-        AscendC::DataCopyPad(tmpExpertIdx[0], expertIdxGm[startIdx], 
-                    {1, static_cast<uint16_t>(copySize * sizeof(int32_t)), 0, 0}, {}
-        );
+        if (copySize > 0) {
+            AscendC::DataCopyPad(tmpExpertIdx[0], expertIdxGm[startIdx],
+                        {1, static_cast<uint16_t>(copySize * sizeof(int32_t)), 0, 0}, {}
+            );
 
-        AscendC::SetFlag<AscendC::HardEvent::MTE2_S>(EVENT_ID0);
-        AscendC::WaitFlag<AscendC::HardEvent::MTE2_S>(EVENT_ID0);
+            AscendC::SetFlag<AscendC::HardEvent::MTE2_S>(EVENT_ID0);
+            AscendC::WaitFlag<AscendC::HardEvent::MTE2_S>(EVENT_ID0);
 
-        for (int32_t i = 0; i < copySize; ++i) {
-            int32_t tokenIdx = (startIdx + i) / topK;
-            bool isActive = gmXActiveMask(tokenIdx);
-            if (!isActive) {
-                tmpExpertIdx.SetValue(i, expertNum);
+            for (int32_t i = 0; i < copySize; ++i) {
+                int32_t tokenIdx = (startIdx + i) / topK;
+                bool isActive = gmXActiveMask(tokenIdx);
+                if (!isActive) {
+                    tmpExpertIdx.SetValue(i, expertNum);
+                }
             }
-        }
 
-        AscendC::SetFlag<AscendC::HardEvent::S_MTE3>(EVENT_ID0);
-        AscendC::WaitFlag<AscendC::HardEvent::S_MTE3>(EVENT_ID0);
-        AscendC::DataCopyPad(expertIdxGm[startIdx], tmpExpertIdx[0], {1, static_cast<uint16_t>(copySize * sizeof(int32_t)), 0, 0, 0});
+            AscendC::SetFlag<AscendC::HardEvent::S_MTE3>(EVENT_ID0);
+            AscendC::WaitFlag<AscendC::HardEvent::S_MTE3>(EVENT_ID0);
+            AscendC::DataCopyPad(expertIdxGm[startIdx], tmpExpertIdx[0], {1, static_cast<uint16_t>(copySize * sizeof(int32_t)), 0, 0, 0});
+        }
         AscendC::SyncAll<true>();
     }
+
+#ifdef DISPATCH_FFN_COMBINE_W8A8_DIRECT_INGRESS_SPARSE_FALLBACK
+    CATLASS_DEVICE
+    void SelectDirectIngressFromPublishedPreferences(Params const &params)
+    {
+        if (!peermemInfo.directIngressEnabled) {
+            return;
+        }
+
+        const int32_t preferenceLane = params.EP * params.expertPerRank;
+        for (int32_t srcRank = 0; srcRank < params.EP; ++srcRank) {
+            if (tokenPerExpert(tokenPerExpertLayout(
+                    srcRank, 0, preferenceLane)) == 0) {
+                peermemInfo.directIngressEnabled = false;
+                return;
+            }
+        }
+    }
+#endif
 
     CATLASS_DEVICE
     void GetCumsumForMMAIV(AscendC::GlobalTensor<int32_t> & tokenPerExpert, AscendC::GlobalTensor<int32_t> & result, uint32_t expertPerRank, uint32_t rankId, uint32_t EP)
@@ -770,6 +836,105 @@ private:
         AscendC::DataCopy(tokenPerExpert, tmp, num);
     }
 
+#ifdef DISPATCH_FFN_COMBINE_W8A8_DIRECT_INGRESS
+    // Sealed-wave W8A8 ingress. Routing first materializes quantized rows in
+    // source-owned peer staging, with each row's dynamic scale in its padding.
+    // Producers then push both the compact int8 payload and the scale into the
+    // destination's expert-contiguous input buffers before publishing one
+    // source-owned epoch.
+    CATLASS_DEVICE
+    void PushDirectIngress(Params const &params)
+    {
+        AscendC::GlobalTensor<ElementA> gmLocalStaging;
+        gmLocalStaging.SetGlobalBuffer(reinterpret_cast<__gm__ ElementA *>(
+            shmem() + peermemInfo.offsetA));
+
+        AscendC::SetFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID0);
+        AscendC::SetFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID1);
+        int32_t pingpongIdx = 0;
+        const int32_t targetCount = params.EP * params.expertPerRank;
+        for (int32_t target = coreIdx; target < targetCount; target += coreNum) {
+            const int32_t dstRank = target / params.expertPerRank;
+            const int32_t groupIdx = target % params.expertPerRank;
+            uint32_t rows = tokenPerExpert(
+                tokenPerExpertLayout(params.rank, dstRank, groupIdx));
+            if (rows == 0) {
+                continue;
+            }
+
+            uint32_t srcRow = 0;
+            for (int32_t priorDst = 0; priorDst < dstRank; ++priorDst) {
+                for (int32_t priorGroup = 0;
+                     priorGroup < params.expertPerRank; ++priorGroup) {
+                    srcRow += tokenPerExpert(tokenPerExpertLayout(
+                        params.rank, priorDst, priorGroup));
+                }
+            }
+            for (int32_t priorGroup = 0; priorGroup < groupIdx; ++priorGroup) {
+                srcRow += tokenPerExpert(tokenPerExpertLayout(
+                    params.rank, dstRank, priorGroup));
+            }
+
+            uint32_t dstRow = 0;
+            for (int32_t priorGroup = 0; priorGroup < groupIdx; ++priorGroup) {
+                for (int32_t srcRank = 0; srcRank < params.EP; ++srcRank) {
+                    dstRow += tokenPerExpert(tokenPerExpertLayout(
+                        srcRank, dstRank, priorGroup));
+                }
+            }
+            for (int32_t srcRank = 0; srcRank < params.rank; ++srcRank) {
+                dstRow += tokenPerExpert(tokenPerExpertLayout(
+                    srcRank, dstRank, groupIdx));
+            }
+
+            if (dstRow >= params.maxOutputSize) {
+                continue;
+            }
+            if (dstRow + rows > params.maxOutputSize) {
+                rows = params.maxOutputSize - dstRow;
+            }
+
+            AscendC::GlobalTensor<ElementA> gmRemoteDirect;
+            gmRemoteDirect.SetGlobalBuffer(reinterpret_cast<__gm__ ElementA *>(
+                shmem(peermemInfo.offsetDirectA, dstRank)));
+            AscendC::GlobalTensor<ElementPerTokenScale> gmRemoteDirectScale;
+            gmRemoteDirectScale.SetGlobalBuffer(
+                reinterpret_cast<__gm__ ElementPerTokenScale *>(
+                    shmem(peermemInfo.offsetDirectScale, dstRank)));
+
+            constexpr int32_t directUbMoveNum = 2;
+            CopyGMToGMPerToken(
+                gmRemoteDirect[dstRow * params.problemShape.k()],
+                gmRemoteDirectScale[dstRow],
+                gmLocalStaging[srcRow * (params.problemShape.k() + UB_ALIGN)],
+                rows, params.problemShape.k(), directUbMoveNum, pingpongIdx);
+        }
+        AscendC::WaitFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID0);
+        AscendC::WaitFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID1);
+
+        AscendC::DataSyncBarrier<AscendC::MemDsbT::DDR>();
+        AscendC::SyncAll<true>();
+        if (coreIdx == 0) {
+            __gm__ uint32_t *localReady = reinterpret_cast<__gm__ uint32_t *>(
+                shmem() + peermemInfo.offsetDirectIngressReady);
+            gm_dcci(localReady);
+            uint32_t epoch = gm_load(localReady) + 1U;
+            gm_store(localReady, epoch);
+            gm_dcci(localReady);
+            AscendC::DataSyncBarrier<AscendC::MemDsbT::DDR>();
+
+            for (int32_t srcRank = 0; srcRank < params.EP; ++srcRank) {
+                __gm__ uint32_t *remoteReady =
+                    reinterpret_cast<__gm__ uint32_t *>(shmem(
+                        peermemInfo.offsetDirectIngressReady, srcRank));
+                gm_signal_wait_until_eq_for_barrier(remoteReady, epoch);
+            }
+            AscendC::DataSyncBarrier<AscendC::MemDsbT::DDR>();
+        }
+        AscendC::SyncAll<true>();
+    }
+#endif
+
     CATLASS_DEVICE
     void UpdateAicFlags(const Params &params)
     {
@@ -834,6 +999,9 @@ private:
         AscendC::SyncAll<true>();
 
         TaggedTokenPerExpertGatherAndGetSumPreRank(params, localTokenPerExpertOffset);
+#ifdef DISPATCH_FFN_COMBINE_W8A8_DIRECT_INGRESS_SPARSE_FALLBACK
+        SelectDirectIngressFromPublishedPreferences(params);
+#endif
 
         if (coreIdx == 0) {
             GetCumsumForMMAIV(tokenPerExpert, cumsumMM, params.expertPerRank, params.rank, params.EP);
@@ -846,6 +1014,12 @@ private:
             prevSum = preSumBeforeRank(coreIdx * params.expertPerRank);
         }
         AscendC::SyncAll<true>();
+
+#ifdef DISPATCH_FFN_COMBINE_W8A8_DIRECT_INGRESS
+        if (peermemInfo.directIngressEnabled) {
+            PushDirectIngress(params);
+        }
+#endif
         
         AscendC::GlobalTensor<int32_t> ExpertTokenNums;
         ExpertTokenNums.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t*>(params.ptrExpertTokenNums));
@@ -867,6 +1041,9 @@ private:
         for (int32_t groupIdx = 0; groupIdx < params.expertPerRank; ++groupIdx) {
             // The ith core reads data from the ith rank's peermem
             uint32_t currentM = cumsumMM((params.EP - 1) * params.expertPerRank + groupIdx);
+#ifdef DISPATCH_FFN_COMBINE_W8A8_DIRECT_INGRESS
+            if (!peermemInfo.directIngressEnabled) {
+#endif
             for(int32_t dstEpIdx = coreIdx; dstEpIdx < params.EP; dstEpIdx += coreNum) {
                 uint32_t rowStart = (dstEpIdx == 0 ? 0 : cumsumMM((dstEpIdx - 1) * params.expertPerRank + groupIdx)) + prevGroupSum1;
                 if (rowStart < params.maxOutputSize) {
@@ -887,7 +1064,16 @@ private:
                 }
 
             }
+#ifdef DISPATCH_FFN_COMBINE_W8A8_DIRECT_INGRESS
+            }
+#endif
+#ifdef DISPATCH_FFN_COMBINE_W8A8_DIRECT_INGRESS
+            if (!peermemInfo.directIngressEnabled) {
+#endif
             AscendC::SyncAll<true>();
+#ifdef DISPATCH_FFN_COMBINE_W8A8_DIRECT_INGRESS
+            }
+#endif
             AscendC::CrossCoreSetFlag<0x2, PIPE_MTE3>(syncgmm1Idx / CROSS_CORE_FLAG_MAX_SET_COUNT);
             syncgmm1Idx ++;
 
@@ -1165,9 +1351,15 @@ private:
 
     struct PeermemInfo {
         int64_t offsetA;
+        int64_t offsetDirectA;
+        int64_t offsetDirectScale;
+        int64_t offsetDirectIngressReady;
+        int64_t directInputBytes;
+        int64_t directScaleBytes;
         int64_t offsetPeerPerTokenScale;
         int64_t offsetPeerTokenPerExpert;
         int64_t offsetD;
+        bool directIngressEnabled;
 
         CATLASS_DEVICE
         PeermemInfo(){}
@@ -1178,6 +1370,55 @@ private:
             offsetPeerPerTokenScale = offsetA + AlignUp(shmem.SegmentSize() / 3, 512); // Occupies 1 MB
             offsetD = offsetPeerPerTokenScale + MB_SIZE;    // Occupies the remaining space
             offsetPeerTokenPerExpert = shmem.SegmentSize() - 2 * MB_SIZE;     // Occupies the final 2 MB
+            offsetDirectA = offsetD;
+            const int64_t paddedExpertCount = AlignUp(
+                static_cast<int64_t>(params.EP) * params.expertPerRank + 1,
+                ALIGN_128);
+            const int64_t countMatrixBytes =
+                static_cast<int64_t>(params.EP) * paddedExpertCount *
+                sizeof(int32_t);
+            offsetDirectIngressReady = AlignUp(
+                offsetPeerTokenPerExpert + countMatrixBytes,
+                AscendC::CACHE_LINE_SIZE);
+            directInputBytes = 0;
+            directScaleBytes = 0;
+            offsetDirectScale = offsetDirectA;
+            directIngressEnabled = false;
+#ifdef DISPATCH_FFN_COMBINE_W8A8_DIRECT_INGRESS
+            const int64_t directInputRows = min(
+                static_cast<int64_t>(params.maxOutputSize),
+                static_cast<int64_t>(params.EP) * params.problemShape.m() *
+                    params.topK);
+            directInputBytes = AlignUp(
+                directInputRows * params.problemShape.k() * sizeof(ElementA),
+                512);
+            offsetDirectScale = offsetDirectA + directInputBytes;
+            directScaleBytes = AlignUp(
+                directInputRows * sizeof(ElementPerTokenScale), 512);
+            const int64_t returnBytes =
+                static_cast<int64_t>(params.problemShape.m()) * params.topK *
+                params.problemShape.k() * sizeof(ElementD2);
+            const int64_t directReturnOffset =
+                offsetDirectScale + directScaleBytes;
+            // Small exact waves are faster on the existing overlapped gather.
+            // EP8 has twice EP4's sealed-wave coordination fan-out: exact
+            // waves cross over at M=8, while masked graph waves through the
+            // full 32-token test capacity do not show a useful win. EP2/EP4
+            // only need the 1-2 token floor. Decide this before buffer binding
+            // so fallback also retains the baseline peer layout and avoids the
+            // distributed selector.
+            const int32_t exactM = params.problemShape.m();
+            const bool preferGather = exactM <= 2 ||
+                (params.EP >= 8 &&
+                 (exactM <= 7 || params.ptrXActiveMask != nullptr));
+            if (!preferGather &&
+                directReturnOffset + returnBytes <= offsetPeerTokenPerExpert &&
+                offsetDirectIngressReady + AscendC::CACHE_LINE_SIZE <=
+                    shmem.SegmentSize() - MB_SIZE) {
+                offsetD = directReturnOffset;
+                directIngressEnabled = true;
+            }
+#endif
         }
     };
 
