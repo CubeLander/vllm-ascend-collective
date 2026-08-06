@@ -3,9 +3,10 @@
 Status: experimental compile-time prototype. Correctness passes on EP2, EP4,
 and EP8; a DeepSeek-V4-Flash W8A8 TP8/EP8 smoke run selected `FUSED_MC2` on
 all ranks and completed. Production-shaped operator measurements retain the
-direct path only where it shows a repeatable kernel-level benefit. A strict
-fresh-server end-to-end bracket did not reproduce that benefit at TP8/EP8, so
-the prototype is not yet supported for production promotion.
+direct path only where it shows a repeatable kernel-level benefit. Strict eager
+and graph-enabled fresh-server end-to-end brackets did not reproduce a stable
+service-level benefit at TP8/EP8, so the prototype is not supported for
+production promotion.
 
 The evaluated candidate defines both
 `DISPATCH_FFN_COMBINE_W8A8_DIRECT_INGRESS` and
@@ -344,7 +345,7 @@ The profiled request result agrees with the graph loop rather than the earlier
 eager-only saturated bracket: candidate request throughput was 4.951 versus
 4.882 requests/s (+1.41%), mean TTFT was 1164.00 versus 1179.63 ms (-1.33%),
 and mean TPOT was 62.44 versus 63.37 ms (-1.46%). This is one candidate/baseline
-pair under profiling, not yet a fresh-server B/C/B promotion result.
+pair under profiling rather than standalone promotion evidence.
 
 TraceLoom found 69 ACLGraph envelopes in each complete collection but promoted
 zero exact replay compositions. The primary cause is a TraceLoom coverage gap:
@@ -359,6 +360,53 @@ regions, so the capability state is `evidence_incomplete`. The formal legacy
 envelopes are nevertheless internally aligned, contain exactly 43 DFC children
 each, and agree with server logs and request-level timing. Treat them as strong
 paired mechanism evidence, not exact capture-body proof.
+
+## Fresh-server graph-enabled brackets
+
+Two subsequent baseline/candidate/baseline brackets used the same
+`FULL_DECODE_ONLY` capture and no profiler. Every leg used identical runtime
+commits and commands, selected `FUSED_MC2`, exercised `num_tokens=8` full-graph
+decode, completed all requests, restored the candidate objects, and left all
+eight devices idle. The enclosing baseline object hashes were identical.
+
+The first bracket measured 32 requests per workload. Its saturated burst
+favored candidate against the enclosing baseline mean, but the baseline drift
+was already larger than the claimed effect:
+
+| Saturated metric | Baseline 1 | Candidate | Baseline 2 | Candidate improvement | Baseline drift |
+|---|---:|---:|---:|---:|---:|
+| output throughput | 62.19 tok/s | 61.85 tok/s | 55.75 tok/s | +4.88% | -10.35% |
+| mean TPOT | 70.97 ms | 70.86 ms | 76.51 ms | +3.90% | +7.80% |
+| median TPOT | 72.30 ms | 72.18 ms | 78.48 ms | +4.27% | +8.54% |
+
+The second bracket lengthened each saturated measurement to 128 requests. It
+reversed the apparent result while retaining large baseline drift:
+
+| Saturated metric | Baseline 1 | Candidate | Baseline 2 | Candidate improvement | Baseline drift |
+|---|---:|---:|---:|---:|---:|
+| output throughput | 71.12 tok/s | 54.95 tok/s | 60.61 tok/s | -16.58% | -14.79% |
+| mean TPOT | 77.35 ms | 81.27 ms | 75.91 ms | -6.06% | -1.85% |
+| median TPOT | 79.60 ms | 78.52 ms | 72.91 ms | -2.97% | -8.40% |
+
+The longer arrival-rate-2 workload exceeded the observed service rate and
+accumulated a queue, so it is not interpreted as a low-load latency result.
+Its output-throughput comparison was tied within drift (-0.34% candidate with
++9.55% baseline drift).
+
+The generated continuation also is not deterministic enough to make these
+request streams token-identical. Inputs and output lengths match exactly, but
+the two baseline legs differ on 26/32 saturated continuations in the short
+bracket and 110/128 in the long bracket. Candidate divergence from baseline 1
+is similar at 24/32 and 106/128, so this is not a candidate-specific correctness
+signal; it does mean different generated tokens can induce different expert
+routing across otherwise matched runs.
+
+The fresh-server graph evidence therefore establishes no repeatable
+end-to-end gain and no stable regression magnitude. It does not overturn the
+paired TraceLoom mechanism result, which directly observes a faster candidate
+graph loop, but it closes the production-promotion gate negatively: keep the
+feature compile-time opt-in until a larger operator effect or a lower-variance
+cross-rank attribution demonstrates service-level value.
 
 ## Build discipline and remaining gates
 
@@ -375,15 +423,13 @@ pairs, and compare their hashes before installing them. On this machine,
 `ASCEND_OPP_PATH` must point at the task-local readable OPP overlay because the
 system vendor configuration is not readable by the workspace user.
 
-The remaining promotion gates are:
+The remaining engineering gates are:
 
 1. source-attribute the remaining wait/scalar control only if another kernel
    optimization is pursued; the first dense-prefix candidate is closed;
-2. rerun the production graph-enabled workload as a fresh-server
-   baseline/candidate/baseline bracket without profiler overhead. The current
-   graph pair is positive and explains the eager/graph distinction, but a
-   roughly 1.4% request-level effect still needs an enclosing baseline to
-   distinguish it from server drift;
+2. treat the fresh-server graph promotion gate as completed but not passed;
+   two brackets disagree and their enclosing baseline drift is larger than the
+   expected service-level effect;
 3. resolve TraceLoom's generic periodic-composition gap and the remaining body
    mismatches only if exact graph-body attribution or a cross-rank critical-path
    claim becomes necessary; the aligned legacy envelopes are sufficient for the
