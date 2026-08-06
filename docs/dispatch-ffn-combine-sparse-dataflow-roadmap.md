@@ -5,12 +5,16 @@ sparse-schedule changes, and the single-node Phase 2 direct-ingress mechanism
 are complete. Phase 3 and Phase 4 both proved their narrowed EP2 mechanisms
 correct but are closed because their eager gains did not survive warmed graph
 replay. Neither will be generalized to EP4 or EP8. Phase 5 is not promoted
-without new evidence of exposed fragment-level latency; Phase 6 production
-policy is the next active planning front. See
+without new evidence of exposed fragment-level latency. Phase 6 now defines a
+single-node A2 opt-in package and canary boundary; topology-blind default
+enablement remains closed until multi-node evidence or a proven host topology
+gate exists. See
 `dispatch-ffn-combine-phase0-measurements.md`,
 `dispatch-ffn-combine-phase2-direct-ingress.md`,
 `dispatch-ffn-combine-phase3-ep2-readiness.md`, and
-`dispatch-ffn-combine-phase4-ep2-egress.md`.
+`dispatch-ffn-combine-phase4-ep2-egress.md`. The production policy and build
+receipt requirements are in
+`dispatch-ffn-combine-phase6-production-policy.md`.
 
 ## Operating rule: prove the micro-logic before the collective
 
@@ -456,14 +460,20 @@ complexity/performance point.
 
 ### Phase 6: production policy and fallback
 
-Status: next active planning front. Treat Phase 2 direct ingress as the last
-mechanism that crossed its microbench gates. Later closed experiments remain
-evidence, not production branches.
+Status: policy defined; packaging and canary execution remain. Treat Phase 2
+direct ingress as the last mechanism that crossed its warmed eager and graph
+gates. BF16 and W8A8 are accepted as profitable mechanisms inside their
+measured selector envelopes. Later closed experiments remain evidence, not
+production branches.
 
-- Determine the measured crossover among stock MC2, current fused, and sparse
-  fused execution.
-- Keep a size-/shape-aware fallback until the sparse path wins reliably at
-  small M.
+- Preserve the measured BF16 and W8A8 selector tables rather than inventing a
+  dtype-independent threshold.
+- Use the existing compile-options surface to produce a named single-node A2
+  candidate package with a clean-build and object-hash receipt.
+- Treat shared-host end-to-end runs as semantic, warmup, and large-regression
+  smoke; use warmed layerwise eager and graph replay for mechanism acceptance.
+- Keep unknown and multi-node topologies on the macro-off package until they
+  gain direct evidence or a uniform host-side topology gate.
 - Treat unsupported topology, capacity, or protocol state as an explicit
   unsupported path and fall back safely; never silently reinterpret it as
   noise.

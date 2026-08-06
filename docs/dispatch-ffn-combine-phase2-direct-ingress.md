@@ -1,8 +1,8 @@
 # Dispatch-FFN-Combine Phase 2 direct-ingress prototype
 
-Status: experimental compile-time prototype; exactness passed repeated EP2 and
-EP4 validation, and the zero-scan sparse selector has hardware crossover
-evidence. The production path remains unchanged unless
+Status: accepted single-node compile-time mechanism; exactness passed repeated
+EP2, EP4, and EP8 validation, and the zero-scan sparse selector has hardware
+crossover evidence. The production path remains unchanged unless
 `DISPATCH_FFN_COMBINE_DIRECT_INGRESS` is defined.
 
 ## Question
@@ -236,16 +236,20 @@ artifact. The conservative release object was restored after collection.
 
 ## Gate result and next work
 
-The direct-placement mechanism passes the Phase 2 EP2 and EP4 correctness
-gates and has a strong first performance signal. It is not ready to become the
-production default because:
+The direct-placement mechanism passes the Phase 2 single-node EP2, EP4, and
+EP8 correctness gates and the warmed layerwise performance gate. It is
+accepted for the single-node opt-in profile described in
+`dispatch-ffn-combine-phase6-production-policy.md`.
 
-1. single-node EP8 with 512 global experts is validated, but multi-node EP is
-   not;
-2. the graph `active=1` selector is consistently faster, but its 4.34% median
-   gain narrowly misses the preregistered 5% useful-effect target;
-3. the dense count exchange remains, even though per-expert receiver pulls and
-   their barriers are gone.
+This acceptance does not make the compile-time guard a topology-blind global
+default. Multi-node EP is untested, and the kernel has no proven host predicate
+that restricts the guarded protocol to one node. The graph `active=1` fallback
+is consistently faster but its 4.34% median gain narrowly misses its own 5%
+useful-effect target; that is not a blocker for the larger direct-ingress route
+families because the selector keeps the tiny wave on the existing path. The
+dense count exchange is part of the accepted mechanism cost. Later EP2
+experiments showed that replacing its sealed boundary or the egress completion
+did not survive graph replay, so removing more control is not a promotion gate.
 
 ### Visibility barrier closure
 
