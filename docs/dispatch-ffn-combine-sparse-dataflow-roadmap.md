@@ -367,6 +367,8 @@ reason.
 ### Phase 3: per-expert ingress readiness
 
 Status: next discriminator, not yet an approved generic implementation.
+The preregistered EP2 protocol and stop rule are in
+`dispatch-ffn-combine-phase3-ep2-readiness.md`.
 
 1. Keep the Phase 2 count exchange, final input layout, GMM schedule, return
    path, and layer-final join unchanged.
