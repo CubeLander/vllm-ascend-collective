@@ -460,17 +460,21 @@ complexity/performance point.
 
 ### Phase 6: production policy and fallback
 
-Status: policy, common BF16 plus W8A8 package receipt, and isolated-prefix
-installation complete; shared-runtime activation and canary execution remain.
-Treat Phase 2 direct ingress as the last mechanism that crossed its warmed
-eager and graph gates. BF16 and W8A8 are accepted as profitable mechanisms
-inside their measured selector envelopes. Later closed experiments remain
-evidence, not production branches.
+Status: policy, common BF16 plus W8A8 package receipt, isolated-prefix
+installation, and process-local EP2, EP4, and EP8 canary complete. A matched
+final extension or wheel and real-model canary remain. Treat Phase 2 direct
+ingress as the last mechanism that crossed its warmed eager and graph gates.
+BF16 and W8A8 are accepted as profitable mechanisms inside their measured
+selector envelopes. Later closed experiments remain evidence, not production
+branches.
 
 - Preserve the measured BF16 and W8A8 selector tables rather than inventing a
   dtype-independent threshold.
 - Use the existing compile-options surface to produce a named single-node A2
   candidate package with a clean-build and object-hash receipt.
+- Pair that package with a recorded, source-matched `vllm_ascend_C`; never
+  permit a missing local extension to fall through to an unrelated machine
+  copy.
 - Treat shared-host end-to-end runs as semantic, warmup, and large-regression
   smoke; use warmed layerwise eager and graph replay for mechanism acceptance.
 - Keep unknown and multi-node topologies on the macro-off package until they

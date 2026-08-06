@@ -1,10 +1,11 @@
 # Dispatch-FFN-Combine Phase 6 production policy
 
-Status: single-node A2 opt-in policy defined and common BF16 plus W8A8 package
-receipt complete. The Phase 2 direct-ingress mechanisms have passed their
-warmed layerwise eager and graph replay gates. They are profitable mechanisms
-inside their measured selector envelopes. This does not yet make either
-compile-time feature a topology-blind global default.
+Status: single-node A2 opt-in policy, common BF16 plus W8A8 package receipt,
+and process-local EP2, EP4, and EP8 package canary complete. The Phase 2
+direct-ingress mechanisms have passed their warmed layerwise eager and graph
+replay gates. They are profitable mechanisms inside their measured selector
+envelopes. This does not yet make either compile-time feature a topology-blind
+global default.
 
 ## Separate performance acceptance from deployment scope
 
@@ -117,8 +118,9 @@ operator files can retain an earlier macro set. A release receipt must record:
 1. source commit and dirty-worktree state;
 2. the complete `OPS_COMPILE_OPTIONS` value;
 3. the generated `custom_compile_options.ini` row;
-4. SHA-256 hashes for every installed object variant; and
-5. the exact destination package and installation timestamp.
+4. SHA-256 hashes for every installed object variant;
+5. the imported `vllm_ascend_C` path and SHA-256 hash; and
+6. the exact destination package and installation timestamp.
 
 A candidate package must be produced from a clean operator build or an
 isolated output directory. Reusing an unverified cache is a release failure.
@@ -187,7 +189,37 @@ empty OPP vendor-registry overlay because the system
 not a source or package deviation. A quiet installation to an isolated,
 explicit prefix succeeded, created only vendor `custom_transformer`, and
 retained all seven object hashes. The shared CANN OPP tree was not modified;
-runtime activation and canary evidence remain open.
+the process-local activation receipt follows below.
+
+### Process-local package canary, 2026-08-06
+
+The isolated installation was activated through its generated environment
+script, without modifying the shared CANN OPP tree. The first run exposed a
+separate release invariant: this source worktree had no local
+`vllm_ascend_C`, so Python silently loaded the stale machine fallback from
+`/vllm-workspace/vllm-ascend`. W8A8 EP2 and EP4 happened to pass, while BF16
+EP2 and EP4 terminated with `SIGSEGV`. Replacing the operator package and its
+OPAPI library with the known-good BF16-only versions did not change that
+failure, distinguishing the extension fallback from an operator-package
+defect.
+
+The canary was repeated with the W8A8 worktree extension whose torch-binding
+sources have zero diff from the common integration branch. Its
+`vllm_ascend_C` SHA-256 is
+`4814a008bf509f5f768ca9a54ca10c90ba7da847ec6f12032c4807df22ea21c5`.
+With that matching extension and the unchanged common package:
+
+- the tracked BF16 and W8A8 EP2 plus EP4 suites passed, four tests in
+  174.04 seconds;
+- the BF16 EP8 pilot passed 56 changing generations with 512 global experts;
+- the W8A8 EP8 changing-route regression passed; and
+- all eight devices returned idle after each campaign.
+
+The deployable unit is therefore the matching Python extension or wheel plus
+the operator package, not the operator package alone. A release must refuse a
+missing or unrecorded local extension rather than falling through to an
+unrelated machine copy. A final wheel build and real-model semantic canary are
+still required before service rollout.
 
 ## Rollout and rollback gates
 
@@ -204,10 +236,10 @@ end-to-end performance campaign:
    dtype path; and
 5. canary only on a declared single-node A2 service pool.
 
-Rollback is package-level and does not require a protocol recovery path:
-drain the canary, reinstall the recorded macro-off package, verify the restored
-object hashes, and repeat the semantic smoke. An impossible epoch skew remains
-a fail-fast upstream-service error.
+Rollback is deployable-unit-level and does not require a protocol recovery
+path: drain the canary, restore the recorded macro-off package and matching
+extension, verify both sets of hashes, and repeat the semantic smoke. An
+impossible epoch skew remains a fail-fast upstream-service error.
 
 An unknown or multi-node topology uses the macro-off package. A global default
 requires either multi-node correctness and performance evidence or a proven
@@ -216,10 +248,10 @@ allowing peers to choose different protocols.
 
 ## Remaining engineering boundary
 
-The next work is shared-runtime activation and canary evidence, not another
-communication mechanism. The common integration branch preserves both dtype
-selector tables, its package objects are identical to their independently
-accepted receipts, and isolated-prefix installation is verified. Runtime
-installation must not silently turn either dtype's selector into the other's
-policy, and the existing macro-off package must remain the recorded rollback
-target.
+The next work is a matched final wheel or extension build and real-model canary,
+not another communication mechanism. The common integration branch preserves
+both dtype selector tables, its package objects are identical to their
+independently accepted receipts, and process-local EP2, EP4, and EP8 package
+activation is verified. Runtime installation must not silently turn either
+dtype's selector into the other's policy or load an unrelated extension, and
+the existing macro-off package must remain the recorded rollback target.
