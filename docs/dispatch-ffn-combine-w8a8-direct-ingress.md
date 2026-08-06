@@ -347,12 +347,18 @@ and mean TPOT was 62.44 versus 63.37 ms (-1.46%). This is one candidate/baseline
 pair under profiling, not yet a fresh-server B/C/B promotion result.
 
 TraceLoom found 69 ACLGraph envelopes in each complete collection but promoted
-zero exact replay compositions. Candidate had 10 and baseline one
-`unrecognized_body_mismatch` regions, so the capability state is
-`evidence_incomplete`; the report used legacy device replay envelopes. The
-formal envelopes are nevertheless internally aligned, contain exactly 43 DFC
-children each, and agree with server logs and request-level timing. Treat them
-as strong paired mechanism evidence, not exact capture-body proof.
+zero exact replay compositions. The primary cause is a TraceLoom coverage gap:
+the exact promoter currently admits only head/repeated-layer/tail compositions,
+whereas these whole-model captures are an exact periodic sequence with
+`pattern_length=1` and `shape_policy=unclassified`. Even body-matching regions
+therefore remain legacy envelopes. This semantic-shape gate is tracked in
+[TraceLoom issue #25](https://github.com/vLLM-HUST/vllm-hust-perf-analyzer/issues/25).
+
+Separately, candidate had 10 and baseline one `unrecognized_body_mismatch`
+regions, so the capability state is `evidence_incomplete`. The formal legacy
+envelopes are nevertheless internally aligned, contain exactly 43 DFC children
+each, and agree with server logs and request-level timing. Treat them as strong
+paired mechanism evidence, not exact capture-body proof.
 
 ## Build discipline and remaining gates
 
@@ -378,9 +384,10 @@ The remaining promotion gates are:
    graph pair is positive and explains the eager/graph distinction, but a
    roughly 1.4% request-level effect still needs an enclosing baseline to
    distinguish it from server drift;
-3. resolve TraceLoom's exact-composition body mismatch only if exact graph-body
-   attribution or a cross-rank critical-path claim becomes necessary; the
-   aligned legacy envelopes are sufficient for the present mechanism result;
+3. resolve TraceLoom's generic periodic-composition gap and the remaining body
+   mismatches only if exact graph-body attribution or a cross-rank critical-path
+   claim becomes necessary; the aligned legacy envelopes are sufficient for the
+   present mechanism result;
 4. preserve the current compile-time opt-in until end-to-end evidence supports
    a production default, then decide whether to upstream the policy as-is or
    expose it through the operator build configuration.
