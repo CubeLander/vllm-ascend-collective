@@ -2,10 +2,11 @@
 
 Status: active experimental implementation. Phase 0, the bounded Phase 1
 sparse-schedule changes, and the single-node Phase 2 direct-ingress mechanism
-are complete. Phase 3 proved correct at EP2 but is closed because its eager
-gain did not survive warmed graph replay. It will not be generalized to EP4 or
-EP8. Phase 4 is the next possible discriminator, after its egress dependency
-and measurement are isolated. See
+are complete. Phase 3 and Phase 4 both proved their narrowed EP2 mechanisms
+correct but are closed because their eager gains did not survive warmed graph
+replay. Neither will be generalized to EP4 or EP8. Phase 5 is not promoted
+without new evidence of exposed fragment-level latency; Phase 6 production
+policy is the next active planning front. See
 `dispatch-ffn-combine-phase0-measurements.md`,
 `dispatch-ffn-combine-phase2-direct-ingress.md`,
 `dispatch-ffn-combine-phase3-ep2-readiness.md`, and
@@ -412,12 +413,17 @@ pipelining.
 
 ### Phase 4: direct return slots and lightweight egress completion
 
-Status: next possible discriminator, not yet implemented. Before changing the
-protocol, identify the exact egress wait on the warmed EP2 critical path and
-preregister one dependency-removal hypothesis. Keep ingress, expert compute,
-and output layout fixed; begin with a two-rank micro-logic prototype and stop
-before generic completion state if eager and graph replay do not both win. The
-preregistered local-only completion-cost ceiling is in
+Status: complete and closed at EP2. A disposable local-only candidate removed
+the entire cross-rank completion handshake while retaining explicit return
+write completion, the local all-AIV join, and the existing unpermute. It passed
+nonzero-output, changing-generation, empty-rank, and graph-padding correctness.
+
+The 64-expert production-shaped case was at parity to slightly slower. In the
+more favorable four-expert sparse case, the clean reverse comparison improved
+eager by about 2.2% but regressed graph replay by about 0.8%. Because this was
+the maximum possible EP2 completion saving, an active-rank mask cannot improve
+the result enough to cross the joint gate. No egress epoch or EP4/EP8
+completion state will be built. The full record is in
 `dispatch-ffn-combine-phase4-ep2-egress.md`.
 
 - Retain and document the current source-owned `offsetD` return placement;
@@ -432,6 +438,13 @@ Gate: output identity and weighted combine remain exact within the accepted
 
 ### Phase 5: optional fragment-level pipeline
 
+Status: not promoted. Phase 3 found no graph-replay benefit from releasing a
+whole early expert, and Phase 4 found no graph-replay benefit even when its
+entire rank-wide egress handshake was removed. Fragment-level descriptors and
+readiness would add more control traffic than either rejected ceiling. Reopen
+only if a future profile exposes a large expert whose payload transfer, GMM,
+or return sits uncovered on the graph critical path.
+
 - Split large active experts into independently ready fragments.
 - Pipeline ingress, GMM, and return only when Phase 4 profiles show sufficient
   exposed latency.
@@ -442,6 +455,10 @@ This phase is optional.  Expert-level readiness may already be the best
 complexity/performance point.
 
 ### Phase 6: production policy and fallback
+
+Status: next active planning front. Treat Phase 2 direct ingress as the last
+mechanism that crossed its microbench gates. Later closed experiments remain
+evidence, not production branches.
 
 - Determine the measured crossover among stock MC2, current fused, and sparse
   fused execution.
