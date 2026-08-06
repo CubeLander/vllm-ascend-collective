@@ -1,10 +1,42 @@
 # Dispatch-FFN-Combine sparse-dataflow roadmap
 
-Status: active experimental implementation. Phase 0 and the bounded Phase 1
-sparse-schedule changes are complete. The compile-time Phase 2 sealed-wave
-direct-ingress prototype passes EP2 correctness and improves six of seven
-bracketed route families; see `dispatch-ffn-combine-phase0-measurements.md`
-and `dispatch-ffn-combine-phase2-direct-ingress.md`.
+Status: active experimental implementation. Phase 0, the bounded Phase 1
+sparse-schedule changes, and the single-node Phase 2 direct-ingress mechanism
+are complete. Phase 3 begins only with an EP2 per-expert-readiness
+discriminator; collective generalization is downstream of a measured win. See
+`dispatch-ffn-combine-phase0-measurements.md` and
+`dispatch-ffn-combine-phase2-direct-ingress.md`.
+
+## Operating rule: prove the micro-logic before the collective
+
+Every new communication or scheduling mechanism starts as the smallest EP2
+prototype that can prove or reject one causal hypothesis. It keeps unrelated
+layout, metadata, ingress, compute, and egress behavior fixed. The prototype
+must expose the dependency directly, include an adversarial delayed-peer case,
+and pass repeated-generation correctness before performance is interpreted.
+
+Performance promotion uses warmed layerwise eager and repeated graph-replay
+microbenchmarks at production shapes. The distributed critical path is the
+slower rank, not one convenient rank or a host-launch average. On a shared
+machine, fresh-server end-to-end measurements remain valuable functional and
+large-regression smoke tests, but they do not arbitrate a small kernel win when
+the enclosing baseline drifts by more than the claimed effect.
+
+The expansion ladder is deliberately one-way:
+
+```text
+EP2 causal prototype
+  -> EP2 correctness and delayed-peer discrimination
+  -> warmed eager and graph-replay win
+  -> EP4 correctness and performance
+  -> EP8 single-node coverage
+  -> multi-node and production policy
+```
+
+If the EP2 micro-logic does not produce a repeatable layerwise win, archive the
+candidate and record the closed path. Do not pay for generalized collective
+state, metadata, topology handling, or service-level campaigns first. A
+negative small prototype is a successful early result.
 
 ## Objective
 
@@ -301,19 +333,23 @@ small-M reduction attributable to active-expert count.
 
 ### Phase 2: discriminate and prototype ingress placement
 
-Status: direct final placement is implemented behind
+Status: complete at the single-node mechanism boundary. Direct final placement
+is implemented behind
 `DISPATCH_FFN_COMBINE_DIRECT_INGRESS`. It reuses the existing complete count
 matrix so every source can compute disjoint final destination prefixes without
 a returned reservation round. A dedicated source-owned epoch publishes one
 sealed request wave; the old per-expert receiver-pull copies and ingress
-barriers are bypassed. EP2 repeated-generation correctness passes.
+barriers are bypassed. Tracked EP2 and EP4 correctness, 2,048-generation EP8
+reuse with 512 global experts, unsigned wrap, explicit payload ordering, and
+fail-fast generation divergence are validated on one node.
 
 The first bracketed 50-sample result improves six route families by 10.6--23.3%
 on the slower-rank device median. Graph M=64 with one active token is
 inconclusive to negative because the new epoch cannot be amortized. A naive
 runtime route-matrix scan was measured and rejected; it added about 50 us of
-rank skew. The prototype remains compile-time experimental while a cheap
-policy input, generic EP, generation reuse, and DCCI ablation are unresolved.
+rank skew. The zero-scan mask selector protects that route family without a
+new communication round. Multi-node coverage and production-default policy
+remain rollout gates rather than reasons to keep Phase 2 mechanism work open.
 
 - Compare the existing source-pull layout, a fixed
   `[expert][source][slot]` direct-write layout, and rank-deduplicated ingress.
@@ -330,14 +366,25 @@ reason.
 
 ### Phase 3: per-expert ingress readiness
 
-- Replace the pre-compute rank-wide/phase-wide ingress boundary with
-  per-expert expected/arrived state.
-- Start an expert as soon as all of its declared fragments are visible.
-- Retain a simple local layer-final join only where the following layer truly
-  requires the entire local output.
+Status: next discriminator, not yet an approved generic implementation.
 
-Gate: adversarial source skew and delayed-fragment tests cannot trigger early
-reads, hangs, or cross-replay ABA.
+1. Keep the Phase 2 count exchange, final input layout, GMM schedule, return
+   path, and layer-final join unchanged.
+2. On EP2, choose at least two destination experts and deliberately delay one
+   source fragment. Replace only the sealed pre-compute ingress boundary with
+   per-expert expected/arrived state.
+3. Demonstrate that an independent expert starts before the delayed expert
+   without an early read, hang, or cross-replay ABA.
+4. Compare against the Phase 2 sealed-wave binary with warmed layerwise eager
+   and repeated graph-replay measurements on the slower rank.
+5. Expand to EP4 only after the EP2 critical path improves repeatably; expand
+   to EP8 only after EP4 preserves the mechanism and benefit.
+
+Stop rule: if the EP2 micro-logic is at parity or slower after correctness and
+warmup are controlled, archive per-expert readiness and do not build its
+generic collective form. Do not combine this discriminator with direct-return
+completion, unpermute removal, compact-metadata redesign, or fragment-level
+pipelining.
 
 ### Phase 4: direct return slots and lightweight egress completion
 
