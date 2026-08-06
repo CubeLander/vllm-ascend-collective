@@ -3,10 +3,12 @@
 Status: experimental compile-time prototype. Correctness passes on EP2, EP4,
 and EP8; a DeepSeek-V4-Flash W8A8 TP8/EP8 smoke run selected `FUSED_MC2` on
 all ranks and completed. Production-shaped operator measurements retain the
-direct path only where it shows a repeatable kernel-level benefit. Strict eager
-and graph-enabled fresh-server end-to-end brackets did not reproduce a stable
-service-level benefit at TP8/EP8, so the prototype is not supported for
-production promotion.
+direct path only where it shows a repeatable kernel-level benefit. Warmed
+layerwise eager and graph-replay measurements pass the Phase 2 mechanism gate.
+Fresh-server end-to-end brackets on the shared host are quantitatively
+inconclusive because enclosing baseline drift exceeds the expected effect;
+they pass as functional smoke but do not yet support making the prototype a
+production default.
 
 The evaluated candidate defines both
 `DISPATCH_FFN_COMBINE_W8A8_DIRECT_INGRESS` and
@@ -15,6 +17,29 @@ the direct data path; the second enables the EP2/EP4 graph preference exchange
 and is rejected at compile time unless the first is also defined. The shared
 epoch helper is hardened independently so an impossible generation skew fails
 fast rather than waiting forever.
+
+## Performance acceptance policy
+
+Phase 2 performance is decided by warmed, production-shaped layerwise evidence
+before collective generalization or service-level promotion work. A direct
+shape must win in eager microbenchmarks on the distributed critical path and
+remain positive in repeated decode-graph replay; fallback shapes must preserve
+baseline parity. Correctness, changing-generation reuse, graph masking, and
+fail-fast protocol gates remain mandatory.
+
+Fresh-server end-to-end runs on a shared machine are smoke tests for path
+selection, semantic completion, stability, and large regressions. They do not
+arbitrate a low-single-digit kernel effect when the two enclosing executions
+of the same baseline drift by more than that effect. A quantitative
+service-level gate becomes authoritative only in an isolated environment with
+stable enclosing baselines and matched routing inputs.
+
+The present evidence satisfies the layerwise mechanism criterion: EP8 exact
+`M=8` improves the all-rank operator median by about 4%, warmed eager rank-0
+`M=8` improves 2.38%, graph-contained `DispatchFFNCombine` improves 3.64% per
+layer, and graph replay median improves 1.53%. The decreasing magnitude is
+consistent with dilution by surrounding graph work rather than disappearance
+of the operator benefit.
 
 ## Purpose
 
@@ -447,9 +472,11 @@ routing across otherwise matched runs.
 The fresh-server graph evidence therefore establishes no repeatable
 end-to-end gain and no stable regression magnitude. It does not overturn the
 paired TraceLoom mechanism result, which directly observes a faster candidate
-graph loop, but it closes the production-promotion gate negatively: keep the
-feature compile-time opt-in until a larger operator effect or a lower-variance
-cross-rank attribution demonstrates service-level value.
+graph loop. Because enclosing baseline drift reaches 10--15%, these brackets
+are classified as successful functional smoke and an invalid quantitative
+comparison, not as a negative operator-performance gate. Keep the feature
+compile-time opt-in until an isolated service-level campaign is needed to
+decide the production default.
 
 ## Build discipline and remaining gates
 
@@ -472,13 +499,14 @@ The remaining engineering gates are:
    mode cannot time the wait, pipeline mode identifies synchronization and
    communication as the broad residual, and dense-prefix preparation,
    self-epoch-poll removal, and local-poll notification all regress;
-2. treat the fresh-server graph promotion gate as completed but not passed;
-   two brackets disagree and their enclosing baseline drift is larger than the
-   expected service-level effect;
+2. treat warmed layerwise eager and graph replay as the completed Phase 2
+   mechanism gate; retain shared-host fresh-server runs as functional smoke,
+   and defer quantitative service promotion to an isolated environment with
+   stable enclosing baselines;
 3. resolve TraceLoom's generic periodic-composition gap and the remaining body
    mismatches only if exact graph-body attribution or a cross-rank critical-path
    claim becomes necessary; the aligned legacy envelopes are sufficient for the
    present mechanism result;
-4. preserve the current compile-time opt-in until end-to-end evidence supports
-   a production default, then decide whether to upstream the policy as-is or
-   expose it through the operator build configuration.
+4. preserve the current compile-time opt-in until isolated service evidence
+   supports a production default, then decide whether to upstream the policy
+   as-is or expose it through the operator build configuration.
