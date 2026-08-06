@@ -184,8 +184,10 @@ After removing the package-only `filePath` field, all seven JSON manifests
 also match the accepted dtype receipts. This machine required a user-readable
 empty OPP vendor-registry overlay because the system
 `opp/vendors/config.ini` is unreadable; that is a host permission condition,
-not a source or package deviation. The package has deliberately not been
-installed, so package canary evidence remains open.
+not a source or package deviation. A quiet installation to an isolated,
+explicit prefix succeeded, created only vendor `custom_transformer`, and
+retained all seven object hashes. The shared CANN OPP tree was not modified;
+runtime activation and canary evidence remain open.
 
 ## Rollout and rollback gates
 
@@ -214,9 +216,10 @@ allowing peers to choose different protocols.
 
 ## Remaining engineering boundary
 
-The next work is installer-level verification and canary evidence, not another
+The next work is shared-runtime activation and canary evidence, not another
 communication mechanism. The common integration branch preserves both dtype
-selector tables and its package objects are identical to their independently
-accepted receipts. Installation must not silently turn either dtype's selector
-into the other's policy, and the existing macro-off package must remain the
-recorded rollback target.
+selector tables, its package objects are identical to their independently
+accepted receipts, and isolated-prefix installation is verified. Runtime
+installation must not silently turn either dtype's selector into the other's
+policy, and the existing macro-off package must remain the recorded rollback
+target.
