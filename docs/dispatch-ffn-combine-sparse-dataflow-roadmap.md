@@ -5,10 +5,10 @@ sparse-schedule changes, and the single-node Phase 2 direct-ingress mechanism
 are complete. Phase 3 and Phase 4 both proved their narrowed EP2 mechanisms
 correct but are closed because their eager gains did not survive warmed graph
 replay. Neither will be generalized to EP4 or EP8. Phase 5 is not promoted
-without new evidence of exposed fragment-level latency. Phase 6 now defines a
-single-node A2 opt-in package and canary boundary; topology-blind default
-enablement remains closed until multi-node evidence or a proven host topology
-gate exists. See
+without new evidence of exposed fragment-level latency. Phase 6 now has a full
+production-opset single-node A2 opt-in package plus process-local and warmed
+real-model canaries; topology-blind default enablement remains closed until
+multi-node evidence or a proven host topology gate exists. See
 `dispatch-ffn-combine-phase0-measurements.md`,
 `dispatch-ffn-combine-phase2-direct-ingress.md`,
 `dispatch-ffn-combine-phase3-ep2-readiness.md`, and
@@ -460,18 +460,20 @@ complexity/performance point.
 
 ### Phase 6: production policy and fallback
 
-Status: policy, common BF16 plus W8A8 package receipt, isolated-prefix
-installation, and process-local EP2, EP4, and EP8 canary complete. A matched
-final extension or wheel and real-model canary remain. Treat Phase 2 direct
-ingress as the last mechanism that crossed its warmed eager and graph gates.
-BF16 and W8A8 are accepted as profitable mechanisms inside their measured
-selector envelopes. Later closed experiments remain evidence, not production
-branches.
+Status: policy, full production-opset BF16 plus W8A8 package receipt,
+isolated-prefix installation, process-local EP2/EP4/EP8 canary, and warmed W8A8
+real-model smoke complete. Publication of the matched wheel/full-package bundle
+and a bounded service-pool canary remain. Treat Phase 2 direct ingress as the
+last mechanism that crossed its warmed eager and graph gates. BF16 and W8A8
+are accepted as profitable mechanisms inside their measured selector
+envelopes. Later closed experiments remain evidence, not production branches.
 
 - Preserve the measured BF16 and W8A8 selector tables rather than inventing a
   dtype-independent threshold.
 - Use the existing compile-options surface to produce a named single-node A2
-  candidate package with a clean-build and object-hash receipt.
+  candidate package with a clean-build, full-runtime inventory, and object-hash
+  receipt. A narrow operator package is a test receipt, never a deployable
+  overlay, because the installer replaces complete vendor subtrees.
 - Pair that package with a recorded, source-matched `vllm_ascend_C`; never
   permit a missing local extension to fall through to an unrelated machine
   copy.

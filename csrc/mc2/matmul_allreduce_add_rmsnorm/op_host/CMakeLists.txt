@@ -7,8 +7,9 @@ if (BUILD_OPEN_PROJECT)
 endif()
 
 add_ops_compile_options(
-    OP_NAME MatmulAllreduceAddRmsnormTensorList
+    OP_NAME MatmulAllreduceAddRmsnorm
     OPTIONS
+        -I${CMAKE_SOURCE_DIR}/third_party/catlass/include
         --cce-auto-sync=off
         -Wno-deprecated-declarations
         -Werror

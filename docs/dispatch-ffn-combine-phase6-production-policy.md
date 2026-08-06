@@ -1,11 +1,11 @@
 # Dispatch-FFN-Combine Phase 6 production policy
 
-Status: single-node A2 opt-in policy, common BF16 plus W8A8 package receipt,
-and process-local EP2, EP4, and EP8 package canary complete. The Phase 2
-direct-ingress mechanisms have passed their warmed layerwise eager and graph
-replay gates. They are profitable mechanisms inside their measured selector
-envelopes. This does not yet make either compile-time feature a topology-blind
-global default.
+Status: single-node A2 opt-in policy, full production-opset BF16 plus W8A8
+package receipt, process-local EP2/EP4/EP8 canary, and warmed real-model W8A8
+smoke complete. The Phase 2 direct-ingress mechanisms have passed their warmed
+layerwise eager and graph replay gates. They are profitable mechanisms inside
+their measured selector envelopes. This does not yet make either compile-time
+feature a topology-blind global default.
 
 ## Separate performance acceptance from deployment scope
 
@@ -94,8 +94,8 @@ bash csrc/build.sh \
   '-DDISPATCH_FFN_COMBINE_W8A8_DIRECT_INGRESS;-DDISPATCH_FFN_COMBINE_W8A8_DIRECT_INGRESS_SPARSE_FALLBACK'
 ```
 
-The common integration package compiles both operators and both selector
-pairs in one clean package:
+For object-receipt and process-local testing, a narrow common package compiles
+both operators and both selector pairs in one clean package:
 
 ```bash
 bash csrc/build.sh \
@@ -106,6 +106,30 @@ bash csrc/build.sh \
   --ops-compile-options \
   '-UDISPATCH_FFN_COMBINE_PROFILE;-DDISPATCH_FFN_COMBINE_DIRECT_INGRESS;-DDISPATCH_FFN_COMBINE_DIRECT_INGRESS_SPARSE_FALLBACK;-DDISPATCH_FFN_COMBINE_W8A8_DIRECT_INGRESS;-DDISPATCH_FFN_COMBINE_W8A8_DIRECT_INGRESS_SPARSE_FALLBACK'
 ```
+
+That two-operator package is deliberately **not** a production overlay. The
+installer replaces the vendor's complete `op_proto`, `op_impl`, and `op_api`
+trees rather than merging individual operators. Production packaging must
+therefore compile the complete operator composition of the runtime it will
+replace. The 2026-08-06 A2 receipt used this exact composition:
+
+```bash
+PRODUCTION_OPS='add_rms_norm_bias,apply_top_k_top_p_custom,causal_conv1d,chunk_fwd_o,chunk_gated_delta_rule_fwd_h,compressor,compressor_metadata,copy_and_expand_eagle_inputs,dequant_swiglu_quant,dispatch_ffn_combine,dispatch_ffn_combine_bf16,fused_gdn_gating,grouped_matmul_swiglu_quant,grouped_matmul_swiglu_quant_v2,grouped_matmul_swiglu_quant_weight_nz_tensor_list,hamming_dist_top_k,hc_post,hc_pre,hc_pre_inv_rms,hc_pre_sinkhorn,inplace_partial_rotary_mul,lightning_indexer,lightning_indexer_quant,matmul_allreduce_add_rmsnorm,moe_gating_top_k,moe_gating_top_k_hash,moe_grouped_matmul,moe_init_routing_custom,ngram_spec_decode,recurrent_gated_delta_rule,reshape_and_cache_bnsd,rms_norm_dynamic_quant,scatter_nd_update_v2,sparse_attn_sharedkv,sparse_flash_attention,store_kv_block,transpose_kv_cache_by_block,vllm_quant_lightning_indexer,kv_quant_sparse_attn_sharedkv_metadata,sparse_attn_sharedkv_metadata,vllm_quant_lightning_indexer_metadata'
+
+bash csrc/build.sh \
+  --ops="$PRODUCTION_OPS" \
+  --soc=ascend910b \
+  --vendor_name=custom \
+  --pkg \
+  --ops-compile-options \
+  '-UDISPATCH_FFN_COMBINE_PROFILE;-DDISPATCH_FFN_COMBINE_DIRECT_INGRESS;-DDISPATCH_FFN_COMBINE_DIRECT_INGRESS_SPARSE_FALLBACK;-DDISPATCH_FFN_COMBINE_W8A8_DIRECT_INGRESS;-DDISPATCH_FFN_COMBINE_W8A8_DIRECT_INGRESS_SPARSE_FALLBACK'
+```
+
+The three trailing metadata operators supply AICPU contents but no AICore
+kernel directory. `--ops=ALL` is not an equivalent release recipe in this
+checkpoint: it links both `lightning_indexer` implementations and fails on
+duplicate definitions. The explicit list is the measured runtime composition,
+not a workaround that silently drops installed operators.
 
 The `custom` vendor argument is intentional: this build system appends
 `_transformer`, so it installs the expected internal vendor
@@ -154,7 +178,7 @@ Phase 3 and Phase 4 baseline. The prior EP2, EP4, EP8, long-generation,
 fail-fast, eager, and graph evidence therefore transfers without a new noisy
 performance run.
 
-### Common integration package receipt, 2026-08-06
+### Narrow common integration object receipt, 2026-08-06
 
 The BF16 and W8A8 branches were combined at source checkpoint `3cf1379ef` on
 `agent/moe-direct-ingress-integration`. The tracked operator sources were
@@ -188,10 +212,43 @@ empty OPP vendor-registry overlay because the system
 `opp/vendors/config.ini` is unreadable; that is a host permission condition,
 not a source or package deviation. A quiet installation to an isolated,
 explicit prefix succeeded, created only vendor `custom_transformer`, and
-retained all seven object hashes. The shared CANN OPP tree was not modified;
-the process-local activation receipt follows below.
+retained all seven object hashes. The shared CANN OPP tree was not modified.
 
-### Process-local package canary, 2026-08-06
+Installing the same package over an isolated copy of the complete runtime
+proved why this artifact is receipt-only: the copy fell from 898 files and
+183 AICore objects to 127 files and seven objects, while `libcust_opapi.so`
+fell from 938,664 to 69,152 bytes. A narrow package must never be promoted as
+an overlay, even when both target operators pass in an empty prefix.
+
+### Full production-opset package receipt, 2026-08-06
+
+The explicit production composition above was built from integration
+checkpoint `911c4dedf` plus the tracked packaging correction in
+`matmul_allreduce_add_rmsnorm`: its compile-option key now names the actual
+operator, and its kernel receives the repository CATLASS include path. Without
+that correction, the complete package fails while compiling
+`catlass/catlass.hpp`; an incremental generated-options cache can conceal the
+bad key. The accepted integration artifact therefore verifies the regenerated
+option row and installed inventory rather than trusting the cache; final
+publication still requires a clean output directory.
+
+The resulting `cann-ops-transformer-custom_linux-aarch64.run` has SHA-256
+`7e705ac1fba659c79c111a2e3ad03af16dbc9a623a791b44ef983e5c53a8f424`.
+Its isolated installation contains 899 files, 183 AICore objects, 38 AICore
+kernel directories, and a 938,664-byte `libcust_opapi.so`. The 38 directory
+names exactly equal the pre-existing production runtime composition. All seven
+BF16 and W8A8 dispatch objects have the hashes in the narrow receipt above.
+The full package therefore preserves production operator coverage while
+carrying the independently accepted dispatch kernels.
+
+The build also required a user-readable OPP registry overlay because the
+system `opp/vendors/config.ini` is unreadable. Neither the shared runtime nor
+the system CANN tree was modified. Stale empty `kv_cache_block_gather` and
+`lightning_indexer_vllm` directories left by the rejected `ALL` configuration
+were removed from the isolated build output before the final manifest was
+generated; neither name appears in the accepted composition.
+
+### Process-local and real-model canary, 2026-08-06
 
 The isolated installation was activated through its generated environment
 script, without modifying the shared CANN OPP tree. The first run exposed a
@@ -207,33 +264,44 @@ The canary was repeated with the W8A8 worktree extension whose torch-binding
 sources have zero diff from the common integration branch. Its
 `vllm_ascend_C` SHA-256 is
 `4814a008bf509f5f768ca9a54ca10c90ba7da847ec6f12032c4807df22ea21c5`.
-With that matching extension and the unchanged common package:
+With that matching extension and the full production-opset package:
 
-- the tracked BF16 and W8A8 EP2 plus EP4 suites passed, four tests in
-  174.04 seconds;
-- the BF16 EP8 pilot passed 56 changing generations with 512 global experts;
+- the tracked BF16 and W8A8 EP2 plus EP4 suites passed, four tests across two
+  invocations;
+- the BF16 EP8 pilot passed 56 changing generations across empty, sparse,
+  local-only, peer-only, one-destination, and mixed waves;
 - the W8A8 EP8 changing-route regression passed; and
 - all eight devices returned idle after each campaign.
 
-The deployable unit is therefore the matching Python extension or wheel plus
-the operator package, not the operator package alone. A release must refuse a
-missing or unrecorded local extension rather than falling through to an
-unrelated machine copy. A final wheel build and real-model semantic canary are
-still required before service rollout.
+The W8A8 real-model canary used runtime checkpoint `c6a6fbdb2`, which combines
+the fused-MC2 selector with the separately verified packed compressed-KV fixes,
+plus the matching extension above and the full package. After model and service
+warmup, a deterministic completion succeeded and an eight-request 64-input by
+16-output smoke completed all requests. The smoke reported 12.32 output
+tokens/s, 389.06 ms mean TPOT, and 0.770 requests/s. Those values are semantic
+and large-regression evidence only; shared-host end-to-end throughput remains
+outside the mechanism acceptance gate.
+
+The deployable unit is therefore the matching Python extension or wheel, its
+declared runtime dependencies, and the full operator package. A release must
+refuse a missing or unrecorded local extension rather than falling through to
+an unrelated machine copy. Publishing that matched wheel/package bundle is
+still required before service rollout; the semantic canary itself is complete.
 
 ## Rollout and rollback gates
 
 The smallest useful rollout is deliberately narrower than another noisy
 end-to-end performance campaign:
 
-1. build all registered variants with the admitted macro pair and verify the
-   generated options and object manifest;
+1. build the complete declared runtime operator composition with the admitted
+   macro pairs and verify the generated options, inventory, and object
+   manifest;
 2. run the existing EP2, EP4, and EP8 correctness suites, including changing
    generations, empty ranks, graph padding, and fail-fast skew;
 3. rerun the selector-boundary eager and graph cases after package
    installation, with normal workload warmup;
 4. run a real-model semantic and short stability smoke using the matching
-   dtype path; and
+   dtype path and declared runtime dependency set; and
 5. canary only on a declared single-node A2 service pool.
 
 Rollback is deployable-unit-level and does not require a protocol recovery
@@ -248,10 +316,12 @@ allowing peers to choose different protocols.
 
 ## Remaining engineering boundary
 
-The next work is a matched final wheel or extension build and real-model canary,
-not another communication mechanism. The common integration branch preserves
-both dtype selector tables, its package objects are identical to their
-independently accepted receipts, and process-local EP2, EP4, and EP8 package
-activation is verified. Runtime installation must not silently turn either
-dtype's selector into the other's policy or load an unrelated extension, and
-the existing macro-off package must remain the recorded rollback target.
+The next work is publication of a matched wheel/full-package bundle and a
+bounded service-pool canary, not another communication mechanism. The common
+integration branch preserves both dtype selector tables, its full package
+objects are identical to their independently accepted receipts, and
+process-local EP2/EP4/EP8 plus real-model package activation are verified.
+Runtime installation must not silently turn either dtype's selector into the
+other's policy, omit unrelated production operators, or load an unrelated
+extension. The existing macro-off full package must remain the recorded
+rollback target.
