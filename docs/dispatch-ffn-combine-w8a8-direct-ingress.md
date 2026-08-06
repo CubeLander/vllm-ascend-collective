@@ -133,7 +133,7 @@ bash csrc/build.sh \
   --vendor_name=custom_transformer \
   --pkg \
   --ops-compile-options \
-  '-UDISPATCH_FFN_COMBINE_PROFILE;-DDISPATCH_FFN_COMBINE_W8A8_DIRECT_INGRESS;-DDISPATCH_FFN_COMBINE_W8A8_DIRECT_INGRESS_SPARSE_FALLBACK'
+  '-DDISPATCH_FFN_COMBINE_W8A8_DIRECT_INGRESS;-DDISPATCH_FFN_COMBINE_W8A8_DIRECT_INGRESS_SPARSE_FALLBACK'
 ```
 
 Do not trust an incremental build directory to identify the macro set.
@@ -142,6 +142,34 @@ must record the source commit, dirty-worktree state, complete
 `OPS_COMPILE_OPTIONS`, generated `custom_compile_options.ini` row, and SHA-256
 hashes of all installed object variants. Build from a clean operator output or
 an isolated output directory.
+
+### W8A8 object receipt, 2026-08-06
+
+The first packaging gate is complete. An isolated three-variant `opc` compile
+used repository checkpoint `9b8d9ef56`; the tracked operator and shared epoch
+helper are unchanged from implementation commit `d03603239`. The tracked
+worktree was clean.
+
+The generated option set was:
+
+```text
+-DDISPATCH_FFN_COMBINE_W8A8_DIRECT_INGRESS;-DDISPATCH_FFN_COMBINE_W8A8_DIRECT_INGRESS_SPARSE_FALLBACK;-Wno-ignored-attributes;-Wno-ignored-attributes;-Wno-ignored-attributes
+```
+
+The isolated generated kernel and helper were byte-identical to the tracked
+files:
+
+| Variant suffix | Bytes | Object SHA-256 | JSON SHA-256 |
+|---|---:|---|---|
+| `9907fbc1444e58de3ad65d22316d7b8f` | 224,800 | `d0bc902eb004559e92d36cc1d83f998cd14175ae92b5ac703c093210b65ca49a` | `e0968dce418c6416bf325b68c106b52fc536d69ed14317e0ef872ad666f36b59` |
+| `af7cdba33254528b52a5326f36d262f5` | 224,824 | `4e531dbfbf4fe689665cdd4612d0bf485f9041b0d7638350891faff1d64c8b89` | `53f691985d16811ad3f9f21a73a386c8a9588a4f174b252f936ab164cfff6c25` |
+| `b12576f77f0efc7337f4f4527a4d909f` | 224,824 | `4279e7fc78ba84f99021c5b1ddc3b7db67fdaec9636add96747c75f251c5e2df` | `da68362b7ed90297442f8f31d50b2a1d0a4b0bf62dbec8944a8023988438b4a1` |
+
+All six files byte-match the final selector-v6 objects used for EP2, EP4, EP8,
+layerwise eager, graph replay, profiler, and real-model smoke evidence. Those
+results therefore transfer without another noisy performance run. An
+installer-level receipt is still required on the final common integration
+commit.
 
 After installation, rerun EP2, EP4, and EP8 changing-generation correctness,
 the eager and graph selector-boundary cases with workload warmup, and the
