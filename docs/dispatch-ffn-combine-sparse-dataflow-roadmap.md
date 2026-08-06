@@ -2,10 +2,12 @@
 
 Status: active experimental implementation. Phase 0, the bounded Phase 1
 sparse-schedule changes, and the single-node Phase 2 direct-ingress mechanism
-are complete. Phase 3 begins only with an EP2 per-expert-readiness
-discriminator; collective generalization is downstream of a measured win. See
-`dispatch-ffn-combine-phase0-measurements.md` and
-`dispatch-ffn-combine-phase2-direct-ingress.md`.
+are complete. Phase 3 proved correct at EP2 but is closed because its eager
+gain did not survive warmed graph replay. It will not be generalized to EP4 or
+EP8. Phase 4 is the next possible discriminator, after its egress dependency
+and measurement are isolated. See `dispatch-ffn-combine-phase0-measurements.md`,
+`dispatch-ffn-combine-phase2-direct-ingress.md`, and
+`dispatch-ffn-combine-phase3-ep2-readiness.md`.
 
 ## Operating rule: prove the micro-logic before the collective
 
@@ -211,7 +213,11 @@ The metadata round naturally produces a compact active-expert worklist:
 
 GMM1, activation, GMM2, and return dispatch should iterate this list rather
 than all `experts_per_rank` slots.  Empty experts must not consume scheduler
-iterations or advance cross-core flags.
+iterations or advance cross-core compute flags. A generation-bearing
+readiness lane is different: if it remains part of the next consumer's wait
+set, its epoch must advance once per invocation even when that invocation has
+no payload. Otherwise a dormant generation turns a later valid publication
+into an apparent impossible skew.
 
 Readiness may be defined per expert or per expert fragment.  Per-fragment
 readiness enables earlier compute but increases control traffic; per-expert
@@ -275,6 +281,8 @@ recorded.
 9. Progress must not depend on an inactive core or rank publishing a signal.
 10. EP2 specialization and generic EP execution must have the same externally
     observable numerical contract.
+11. Every reusable generation-bearing readiness lane advances exactly once per
+    invocation, including invocations whose payload on that lane is empty.
 
 ## Development phases
 
@@ -366,8 +374,20 @@ reason.
 
 ### Phase 3: per-expert ingress readiness
 
-Status: next discriminator, not yet an approved generic implementation.
-The preregistered EP2 protocol and stop rule are in
+Status: complete and closed at EP2. A disposable candidate released expert 0
+before the remaining ingress wave, passed changing-route and delayed-peer
+correctness, and improved the deliberately staggered eager case by roughly
+3--5%. Warmed graph replay was instead at parity: the cleanest Phase 2 and
+candidate critical medians were 615.38 us and 617.49 us. A second local-relay
+design measured 615.32 us against that 615.38 us baseline. The improvement is
+therefore not repeatable in graph execution, so the stop rule rejects generic
+EP4/EP8 state and keeps the Phase 2 sealed wave.
+
+The experiment also established two protocol constraints. First,
+`CrossCoreSetFlag<0x2>` is scoped to one physical AI Core, and both AIV
+subcores must signal their paired AIC; one global AIV coordinator deadlocks.
+Second, source-owned expert readiness must advance on an empty generation as
+well as a nonempty one. The full implementation and measurement record is in
 `dispatch-ffn-combine-phase3-ep2-readiness.md`.
 
 1. Keep the Phase 2 count exchange, final input layout, GMM schedule, return
@@ -389,6 +409,12 @@ completion, unpermute removal, compact-metadata redesign, or fragment-level
 pipelining.
 
 ### Phase 4: direct return slots and lightweight egress completion
+
+Status: next possible discriminator, not yet implemented. Before changing the
+protocol, identify the exact egress wait on the warmed EP2 critical path and
+preregister one dependency-removal hypothesis. Keep ingress, expert compute,
+and output layout fixed; begin with a two-rank micro-logic prototype and stop
+before generic completion state if eager and graph replay do not both win.
 
 - Retain and document the current source-owned `offsetD` return placement;
   verify its exact `(token, top-k slot)` identity contract.
