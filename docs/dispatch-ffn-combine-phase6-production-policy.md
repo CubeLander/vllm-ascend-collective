@@ -105,6 +105,36 @@ operator files can retain an earlier macro set. A release receipt must record:
 A candidate package must be produced from a clean operator build or an
 isolated output directory. Reusing an unverified cache is a release failure.
 
+### BF16 object receipt, 2026-08-06
+
+The first packaging gate is complete for BF16. An isolated four-variant `opc`
+compile used repository checkpoint `598f1ecfb`, whose tracked operator source
+is unchanged from kernel commit `161ca3bd2` and shared epoch-helper commit
+`54d5478ce`. All tracked files were clean; the unrelated untracked
+`extra-info/` directory was excluded from the build.
+
+The generated option row was:
+
+```text
+ALL,,-UDISPATCH_FFN_COMBINE_PROFILE;-DDISPATCH_FFN_COMBINE_DIRECT_INGRESS;-DDISPATCH_FFN_COMBINE_DIRECT_INGRESS_SPARSE_FALLBACK;-Wno-ignored-attributes;-Wno-ignored-attributes
+```
+
+The generated kernel source and shared epoch helper were byte-identical to the
+tracked files. Every object was 605,560 bytes:
+
+| Variant suffix | Object SHA-256 | JSON SHA-256 |
+|---|---|---|
+| `2cdb81c6f496f276126540d98f0dc828` | `57245716904cf1708a65abd2f885afb497429c72bcd47119714c710da96c4c53` | `3c2dbf3c53f55966125a4142976ab28b3eda49209ab287612f81733933c1bac5` |
+| `6f342c7338f87a7ad09f5a9dd3c8d8fd` | `f38dbeccc5a9594c89db7f94e97834cc6773757aed5ea30f31f53f126380f754` | `44bad2e8de6f8b4d52eccdc25002f9e720a9d8866284407f660b35fde99efa4b` |
+| `8506bed211987078143317c8ace3482e` | `01c8066cb0b573844a338b87772b5960709a316c327fb7ea63cefb77f0196834` | `643d07e8d48261e853e38abf1822b4dd8ae20a8d0f26b1cb1b36d664cf924bdc` |
+| `dc184900a0beaeecc753318ebc545c55` | `c26f3db0e533431dac8add91c62661719e37a8848b508d733f1ae4ebc3eeaab3` | `57e78fca020f38980874ebc8b69fb0f7a8ada98ca239607e79be005d946d2457` |
+
+All eight files byte-match the installed Phase 2 candidate that supplied the
+Phase 3 and Phase 4 baseline. The prior EP2, EP4, EP8, long-generation,
+fail-fast, eager, and graph evidence therefore transfers without a new noisy
+performance run. Packaging still needs an installer-level receipt on the final
+common integration commit.
+
 ## Rollout and rollback gates
 
 The smallest useful rollout is deliberately narrower than another noisy
