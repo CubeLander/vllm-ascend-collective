@@ -1,10 +1,10 @@
 # Dispatch-FFN-Combine Phase 6 production policy
 
-Status: single-node A2 opt-in policy defined. The BF16 and W8A8 Phase 2
-direct-ingress mechanisms have passed their warmed layerwise eager and graph
-replay gates. They are profitable mechanisms inside their measured selector
-envelopes. This does not yet make either compile-time feature a topology-blind
-global default.
+Status: single-node A2 opt-in policy defined and common BF16 plus W8A8 package
+receipt complete. The Phase 2 direct-ingress mechanisms have passed their
+warmed layerwise eager and graph replay gates. They are profitable mechanisms
+inside their measured selector envelopes. This does not yet make either
+compile-time feature a topology-blind global default.
 
 ## Separate performance acceptance from deployment scope
 
@@ -75,7 +75,7 @@ the repository root, the BF16 candidate package is built with:
 bash csrc/build.sh \
   --ops=dispatch_ffn_combine_bf16 \
   --soc=ascend910b \
-  --vendor_name=custom_transformer \
+  --vendor_name=custom \
   --pkg \
   --ops-compile-options \
   '-UDISPATCH_FFN_COMBINE_PROFILE;-DDISPATCH_FFN_COMBINE_DIRECT_INGRESS;-DDISPATCH_FFN_COMBINE_DIRECT_INGRESS_SPARSE_FALLBACK'
@@ -87,11 +87,29 @@ On the W8A8 direct-ingress branch, substitute the W8A8 operator and guards:
 bash csrc/build.sh \
   --ops=dispatch_ffn_combine \
   --soc=ascend910b \
-  --vendor_name=custom_transformer \
+  --vendor_name=custom \
   --pkg \
   --ops-compile-options \
   '-DDISPATCH_FFN_COMBINE_W8A8_DIRECT_INGRESS;-DDISPATCH_FFN_COMBINE_W8A8_DIRECT_INGRESS_SPARSE_FALLBACK'
 ```
+
+The common integration package compiles both operators and both selector
+pairs in one clean package:
+
+```bash
+bash csrc/build.sh \
+  --ops=dispatch_ffn_combine_bf16,dispatch_ffn_combine \
+  --soc=ascend910b \
+  --vendor_name=custom \
+  --pkg \
+  --ops-compile-options \
+  '-UDISPATCH_FFN_COMBINE_PROFILE;-DDISPATCH_FFN_COMBINE_DIRECT_INGRESS;-DDISPATCH_FFN_COMBINE_DIRECT_INGRESS_SPARSE_FALLBACK;-DDISPATCH_FFN_COMBINE_W8A8_DIRECT_INGRESS;-DDISPATCH_FFN_COMBINE_W8A8_DIRECT_INGRESS_SPARSE_FALLBACK'
+```
+
+The `custom` vendor argument is intentional: this build system appends
+`_transformer`, so it installs the expected internal vendor
+`custom_transformer`. Passing `custom_transformer` would incorrectly produce
+`custom_transformer_transformer`.
 
 The build directory is not a source of truth. Incremental CMake and generated
 operator files can retain an earlier macro set. A release receipt must record:
@@ -132,8 +150,42 @@ tracked files. Every object was 605,560 bytes:
 All eight files byte-match the installed Phase 2 candidate that supplied the
 Phase 3 and Phase 4 baseline. The prior EP2, EP4, EP8, long-generation,
 fail-fast, eager, and graph evidence therefore transfers without a new noisy
-performance run. Packaging still needs an installer-level receipt on the final
-common integration commit.
+performance run.
+
+### Common integration package receipt, 2026-08-06
+
+The BF16 and W8A8 branches were combined at source checkpoint `3cf1379ef` on
+`agent/moe-direct-ingress-integration`. The tracked operator sources were
+clean at build start and exactly matched their accepted dtype branches. The
+package used the combined command above, and its generated option row was:
+
+```text
+ALL,,-UDISPATCH_FFN_COMBINE_PROFILE;-DDISPATCH_FFN_COMBINE_DIRECT_INGRESS;-DDISPATCH_FFN_COMBINE_DIRECT_INGRESS_SPARSE_FALLBACK;-DDISPATCH_FFN_COMBINE_W8A8_DIRECT_INGRESS;-DDISPATCH_FFN_COMBINE_W8A8_DIRECT_INGRESS_SPARSE_FALLBACK;-Wno-ignored-attributes
+```
+
+The package is named `cann-ops-transformer-custom_linux-aarch64.run`, installs
+under internal vendor `custom_transformer`, and has SHA-256
+`fe8418efbcf850f9b237d1dda6dd6ecb366a6b669649d1b3792dccfa82cffa2d`.
+The generated kernel and shared epoch-helper sources for both dtypes were
+byte-identical to the tracked files. All seven packaged objects byte-match the
+previous isolated receipts:
+
+| Operator and variant suffix | Object SHA-256 |
+|---|---|
+| W8A8 `9907fbc1444e58de3ad65d22316d7b8f` | `d0bc902eb004559e92d36cc1d83f998cd14175ae92b5ac703c093210b65ca49a` |
+| W8A8 `af7cdba33254528b52a5326f36d262f5` | `4e531dbfbf4fe689665cdd4612d0bf485f9041b0d7638350891faff1d64c8b89` |
+| W8A8 `b12576f77f0efc7337f4f4527a4d909f` | `4279e7fc78ba84f99021c5b1ddc3b7db67fdaec9636add96747c75f251c5e2df` |
+| BF16 `2cdb81c6f496f276126540d98f0dc828` | `57245716904cf1708a65abd2f885afb497429c72bcd47119714c710da96c4c53` |
+| BF16 `6f342c7338f87a7ad09f5a9dd3c8d8fd` | `f38dbeccc5a9594c89db7f94e97834cc6773757aed5ea30f31f53f126380f754` |
+| BF16 `8506bed211987078143317c8ace3482e` | `01c8066cb0b573844a338b87772b5960709a316c327fb7ea63cefb77f0196834` |
+| BF16 `dc184900a0beaeecc753318ebc545c55` | `c26f3db0e533431dac8add91c62661719e37a8848b508d733f1ae4ebc3eeaab3` |
+
+After removing the package-only `filePath` field, all seven JSON manifests
+also match the accepted dtype receipts. This machine required a user-readable
+empty OPP vendor-registry overlay because the system
+`opp/vendors/config.ini` is unreadable; that is a host permission condition,
+not a source or package deviation. The package has deliberately not been
+installed, so package canary evidence remains open.
 
 ## Rollout and rollback gates
 
@@ -162,8 +214,9 @@ allowing peers to choose different protocols.
 
 ## Remaining engineering boundary
 
-The next work is packaging and canary evidence, not another communication
-mechanism. BF16 and W8A8 currently live on separately rebased development
-branches, so their final integration must preserve both selector tables and
-repeat the clean-build receipt on the common target commit. Branch integration
-must not silently turn either dtype's selector into the other's policy.
+The next work is installer-level verification and canary evidence, not another
+communication mechanism. The common integration branch preserves both dtype
+selector tables and its package objects are identical to their independently
+accepted receipts. Installation must not silently turn either dtype's selector
+into the other's policy, and the existing macro-off package must remain the
+recorded rollback target.

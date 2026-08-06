@@ -460,11 +460,11 @@ complexity/performance point.
 
 ### Phase 6: production policy and fallback
 
-Status: policy defined; packaging and canary execution remain. Treat Phase 2
-direct ingress as the last mechanism that crossed its warmed eager and graph
-gates. BF16 and W8A8 are accepted as profitable mechanisms inside their
-measured selector envelopes. Later closed experiments remain evidence, not
-production branches.
+Status: policy and common BF16 plus W8A8 package receipt complete; installation
+and canary execution remain. Treat Phase 2 direct ingress as the last mechanism
+that crossed its warmed eager and graph gates. BF16 and W8A8 are accepted as
+profitable mechanisms inside their measured selector envelopes. Later closed
+experiments remain evidence, not production branches.
 
 - Preserve the measured BF16 and W8A8 selector tables rather than inventing a
   dtype-independent threshold.

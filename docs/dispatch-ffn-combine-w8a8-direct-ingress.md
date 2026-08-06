@@ -130,7 +130,7 @@ root, build the single-node candidate with:
 bash csrc/build.sh \
   --ops=dispatch_ffn_combine \
   --soc=ascend910b \
-  --vendor_name=custom_transformer \
+  --vendor_name=custom \
   --pkg \
   --ops-compile-options \
   '-DDISPATCH_FFN_COMBINE_W8A8_DIRECT_INGRESS;-DDISPATCH_FFN_COMBINE_W8A8_DIRECT_INGRESS_SPARSE_FALLBACK'
