@@ -55,6 +55,11 @@ constexpr uint32_t INGRESS_READY_MAGIC_MASK = 0xFF000000U;
 #error "direct-ingress sparse fallback requires direct ingress"
 #endif
 
+#if defined(DISPATCH_FFN_COMBINE_RANK_DEDUP_PULL) && \
+    defined(DISPATCH_FFN_COMBINE_DIRECT_INGRESS)
+#error "rank-deduplicated pull and direct ingress are mutually exclusive"
+#endif
+
 template <
     class BlockMmad_,
     class BlockScheduler_,
@@ -944,6 +949,160 @@ private:
     }
 #endif
 
+#ifdef DISPATCH_FFN_COMBINE_RANK_DEDUP_PULL
+    // Experimental EP2 discriminator. Keep the existing routing pass for its
+    // count matrix and return metadata, but replace route-expanded peer
+    // payload with one hidden row per source token plus masked top-k expert
+    // IDs. The receiver reconstructs the unchanged expert-major GMM1 input.
+    CATLASS_DEVICE
+    void StageRankDeduplicatedIngress(Params const &params)
+    {
+        if (!peermemInfo.rankDedupPullEnabled) {
+            return;
+        }
+
+        AscendC::GlobalTensor<ElementA> stagedX;
+        stagedX.SetGlobalBuffer(reinterpret_cast<__gm__ ElementA *>(
+            shmem() + peermemInfo.offsetA));
+        AscendC::GlobalTensor<ElementA> sourceX;
+        sourceX.SetGlobalBuffer(params.ptrA);
+
+        const int32_t hiddenElements =
+            params.problemShape.m() * params.problemShape.k();
+        const int32_t hiddenBase = hiddenElements / coreNum;
+        const int32_t hiddenRemainder = hiddenElements % coreNum;
+        const int32_t hiddenStart =
+            coreIdx * hiddenBase + min(coreIdx, hiddenRemainder);
+        const int32_t hiddenEnd =
+            (coreIdx + 1) * hiddenBase + min(coreIdx + 1, hiddenRemainder);
+        if (hiddenEnd > hiddenStart) {
+            CopyGMToGM(stagedX[hiddenStart], sourceX[hiddenStart],
+                       hiddenEnd - hiddenStart, params.ubMoveNum);
+        }
+
+        AscendC::GlobalTensor<int32_t> stagedExpertIds;
+        stagedExpertIds.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t *>(
+            shmem() + peermemInfo.offsetRankDedupExpertIdx));
+        AscendC::GlobalTensor<int32_t> sourceExpertIds;
+        sourceExpertIds.SetGlobalBuffer(
+            reinterpret_cast<__gm__ int32_t *>(params.expertIdx));
+        const int32_t routeElements = params.problemShape.m() * params.topK;
+        const int32_t routeBase = routeElements / coreNum;
+        const int32_t routeRemainder = routeElements % coreNum;
+        const int32_t routeStart =
+            coreIdx * routeBase + min(coreIdx, routeRemainder);
+        const int32_t routeEnd =
+            (coreIdx + 1) * routeBase + min(coreIdx + 1, routeRemainder);
+        if (routeEnd > routeStart) {
+            constexpr int32_t METADATA_COPY_ELEMENTS = 4096;
+            CopyGMToGM(stagedExpertIds[routeStart], sourceExpertIds[routeStart],
+                       routeEnd - routeStart, METADATA_COPY_ELEMENTS);
+        }
+
+        // The tagged count row is the publication signal for both staged
+        // arrays. Complete the local peer-window writes before any core starts
+        // the existing remote count publication.
+        AscendC::DataSyncBarrier<AscendC::MemDsbT::DDR>();
+        AscendC::SyncAll<true>();
+    }
+
+    CATLASS_DEVICE
+    void PullRankDeduplicatedIngress(Params const &params)
+    {
+        if (!peermemInfo.rankDedupPullEnabled) {
+            return;
+        }
+
+        constexpr int32_t METADATA_BUFFER_OFFSET = 64 * 1024;
+        constexpr int32_t METADATA_CHUNK_ELEMENTS = 4096;
+        AscendC::LocalTensor<int32_t> expertIds =
+            resource.ubBuf.template GetBufferByByte<int32_t>(
+                METADATA_BUFFER_OFFSET);
+        const int32_t routeElements = params.problemShape.m() * params.topK;
+        const int32_t targetCount = params.EP * params.expertPerRank;
+        const int32_t globalExpertBase = params.rank * params.expertPerRank;
+
+        // The tagged count row is the remote publication signal for the
+        // source-local staging writes. Order its observation before reading
+        // the peer payload and metadata.
+        AscendC::DataSyncBarrier<AscendC::MemDsbT::DDR>();
+
+        for (int32_t target = coreIdx; target < targetCount;
+             target += coreNum) {
+            const int32_t srcRank = target / params.expertPerRank;
+            const int32_t groupIdx = target % params.expertPerRank;
+            uint32_t expectedRows = tokenPerExpert(tokenPerExpertLayout(
+                srcRank, params.rank, groupIdx));
+            if (expectedRows == 0) {
+                continue;
+            }
+
+            uint32_t dstRow = 0;
+            for (int32_t priorGroup = 0; priorGroup < groupIdx;
+                 ++priorGroup) {
+                for (int32_t priorSrc = 0; priorSrc < params.EP; ++priorSrc) {
+                    dstRow += tokenPerExpert(tokenPerExpertLayout(
+                        priorSrc, params.rank, priorGroup));
+                }
+            }
+            for (int32_t priorSrc = 0; priorSrc < srcRank; ++priorSrc) {
+                dstRow += tokenPerExpert(tokenPerExpertLayout(
+                    priorSrc, params.rank, groupIdx));
+            }
+
+            if (dstRow >= params.maxOutputSize) {
+                continue;
+            }
+            if (dstRow + expectedRows > params.maxOutputSize) {
+                expectedRows = params.maxOutputSize - dstRow;
+            }
+
+            AscendC::GlobalTensor<ElementA> remoteX;
+            remoteX.SetGlobalBuffer(reinterpret_cast<__gm__ ElementA *>(
+                shmem(peermemInfo.offsetA, srcRank)));
+            AscendC::GlobalTensor<int32_t> remoteExpertIds;
+            remoteExpertIds.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t *>(
+                shmem(peermemInfo.offsetRankDedupExpertIdx, srcRank)));
+
+            uint32_t producedRows = 0;
+            for (int32_t routeBase = 0; routeBase < routeElements;
+                 routeBase += METADATA_CHUNK_ELEMENTS) {
+                const int32_t chunkElements = min(
+                    METADATA_CHUNK_ELEMENTS, routeElements - routeBase);
+                AscendC::DataCopyPad(
+                    expertIds, remoteExpertIds[routeBase],
+                    {1, static_cast<uint16_t>(
+                            chunkElements * sizeof(int32_t)), 0, 0}, {});
+                AscendC::SetFlag<AscendC::HardEvent::MTE2_S>(EVENT_ID0);
+                AscendC::WaitFlag<AscendC::HardEvent::MTE2_S>(EVENT_ID0);
+
+                for (int32_t i = 0; i < chunkElements; ++i) {
+                    if (expertIds.GetValue(i) != globalExpertBase + groupIdx) {
+                        continue;
+                    }
+                    if (producedRows >= expectedRows) {
+                        break;
+                    }
+                    const int32_t tokenIdx = (routeBase + i) / params.topK;
+                    CopyGMToGM(
+                        gmA[(dstRow + producedRows) * params.problemShape.k()],
+                        remoteX[tokenIdx * params.problemShape.k()],
+                        params.problemShape.k(), params.ubMoveNum);
+                    ++producedRows;
+                }
+            }
+            if (producedRows != expectedRows) {
+                trap();
+            }
+        }
+
+        // Complete receiver-local packing before publishing any AIV-to-AIC
+        // expert readiness flag.
+        AscendC::DataSyncBarrier<AscendC::MemDsbT::DDR>();
+        AscendC::SyncAll<true>();
+    }
+#endif
+
     CATLASS_DEVICE
     void UpdateAicFlags(const Params &params)
     {
@@ -1010,6 +1169,9 @@ private:
         &params.moeInitRoutingQuantV2TilingData, params.initRoutingQuantTilingKey);
 
         AscendC::SyncAll<true>();
+#ifdef DISPATCH_FFN_COMBINE_RANK_DEDUP_PULL
+        StageRankDeduplicatedIngress(params);
+#endif
         TaggedTokenPerExpertGatherAndGetSumPreRank(params, localTokenPerExpertOffset);
 #ifdef DISPATCH_FFN_COMBINE_DIRECT_INGRESS_SPARSE_FALLBACK
         SelectDirectIngressFromPublishedPreferences(params);
@@ -1026,6 +1188,10 @@ private:
             prevSum = preSumBeforeRank(coreIdx * params.expertPerRank);
         }
         AscendC::SyncAll<true>();
+
+#ifdef DISPATCH_FFN_COMBINE_RANK_DEDUP_PULL
+        PullRankDeduplicatedIngress(params);
+#endif
 
 #ifdef DISPATCH_FFN_COMBINE_DIRECT_INGRESS
         if (peermemInfo.directIngressEnabled) {
@@ -1059,6 +1225,9 @@ private:
 #ifdef DISPATCH_FFN_COMBINE_DIRECT_INGRESS
             if (!peermemInfo.directIngressEnabled) {
 #endif
+#ifdef DISPATCH_FFN_COMBINE_RANK_DEDUP_PULL
+            if (!peermemInfo.rankDedupPullEnabled) {
+#endif
             for(int32_t dstEpIdx = coreIdx; dstEpIdx < params.EP; dstEpIdx += coreNum) {
                 uint32_t rowStart = (dstEpIdx == 0 ? 0 : cumsumMM((dstEpIdx - 1) * params.expertPerRank + groupIdx)) + prevGroupSum1;
                 if (rowStart < params.maxOutputSize) {
@@ -1086,6 +1255,9 @@ private:
 #ifdef DISPATCH_FFN_COMBINE_DIRECT_INGRESS
             }
 #endif
+#ifdef DISPATCH_FFN_COMBINE_RANK_DEDUP_PULL
+            }
+#endif
             // The route counts are shared by every AIV core, so this branch is
             // uniform. An unscheduled expert has neither ingress writes nor an
             // AIC consumer: omit both its barrier and progress signal. The next
@@ -1095,8 +1267,14 @@ private:
 #ifdef DISPATCH_FFN_COMBINE_DIRECT_INGRESS
                 if (!peermemInfo.directIngressEnabled) {
 #endif
+#ifdef DISPATCH_FFN_COMBINE_RANK_DEDUP_PULL
+                if (!peermemInfo.rankDedupPullEnabled) {
+#endif
                 AscendC::SyncAll<true>();
 #ifdef DISPATCH_FFN_COMBINE_DIRECT_INGRESS
+                }
+#endif
+#ifdef DISPATCH_FFN_COMBINE_RANK_DEDUP_PULL
                 }
 #endif
                 AscendC::CrossCoreSetFlag<0x2, PIPE_MTE3>(
@@ -1349,11 +1527,13 @@ private:
         int64_t offsetA;
         int64_t offsetDirectA;
         int64_t offsetDirectIngressReady;
+        int64_t offsetRankDedupExpertIdx;
         int64_t directInputBytes;
         int64_t offsetPeerPerTokenScale;
         int64_t offsetPeerTokenPerExpert;
         int64_t offsetD;
         bool directIngressEnabled;
+        bool rankDedupPullEnabled;
 
         CATLASS_DEVICE
         PeermemInfo(){}
@@ -1365,6 +1545,10 @@ private:
             offsetD = offsetPeerPerTokenScale + MB_SIZE;
             offsetPeerTokenPerExpert = shmem.SegmentSize() - 2 * MB_SIZE;
             offsetDirectA = offsetD;
+            offsetRankDedupExpertIdx = offsetA + AlignUp(
+                static_cast<int64_t>(params.problemShape.m()) *
+                    params.problemShape.k() * sizeof(ElementA),
+                512);
             // Place the epoch immediately after the padded count matrix, on
             // its own hardware cache line. The final rank barrier starts at
             // segmentSize - 1 MiB, so the enable guard below fails closed if
@@ -1380,6 +1564,16 @@ private:
                 AscendC::CACHE_LINE_SIZE);
             directInputBytes = 0;
             directIngressEnabled = false;
+            rankDedupPullEnabled = false;
+#ifdef DISPATCH_FFN_COMBINE_RANK_DEDUP_PULL
+            const int64_t rankDedupEnd = AlignUp(
+                offsetRankDedupExpertIdx +
+                    static_cast<int64_t>(params.problemShape.m()) *
+                        params.topK * sizeof(int32_t),
+                512);
+            rankDedupPullEnabled = params.EP == 2 &&
+                rankDedupEnd <= offsetPeerPerTokenScale;
+#endif
 #ifdef DISPATCH_FFN_COMBINE_DIRECT_INGRESS
             // maxOutputSize is a policy capacity (131072 in the production
             // wrapper), not the number of rows this invocation can produce.
