@@ -248,3 +248,41 @@ per-logical-expert signal is adopted as the Stage B completion model because it
 aligns signaling with semantic work rather than physical rank boundaries.
 Progressive combine remains deliberately separable because top-k readiness may
 concentrate near the end of the expert schedule.
+
+## Stage A discriminator outcome (2026-08-08)
+
+The BF16 EP2 Stage A prototype was implemented behind the experimental
+`DISPATCH_FFN_COMBINE_SINGLE_SEND_INGRESS` compile guard. It sends each hidden
+row once per unique `(source token, destination rank)` pair, carries compact
+expert-grouped route references, pulls `U * K` elements across the peer
+boundary, and performs the remaining `R * K` expert-major expansion from a
+receiver-local packet buffer. The production default remains unchanged.
+
+Exactness passed on NPUs 4/5 for graph-static `M = 8, 64, 236, 256`, including
+the primary top-k-eight `M = 236` shape. Executable validation exposed two
+protocol details that the initial design needed in concrete form:
+
+- persistent generation slots must live beyond the routing pass's
+  `M * topK * K` staging extent; and
+- routing MTE3 writes must be drained before reusing that extent, while scalar
+  reference and lane-count cache lines must be explicitly published before
+  the ready generation.
+
+The performance discriminator was negative. Back-to-back captured-graph runs
+on the same NPU pair measured the following slower-rank device medians:
+
+| Shape | Single-send Stage A | Sealed-wave direct |
+| --- | ---: | ---: |
+| `M=8, active=8` | 252 us | 253 us |
+| `M=64, active=64` | 369 us | 283 us |
+| `M=236, active=236` | 658 us | 387 us |
+| `M=256, active=256` | 712 us | 378 us |
+
+Stage A therefore exceeds the preregistered three-percent stop threshold for
+the production-like shapes. The remote-payload reduction is real, but two
+route passes on a small producer-core set plus receiver-local packet expansion
+cost more than the saved peer traffic. This implementation is retained as an
+auditable negative prototype; Stages B and C must not be built to rescue it.
+Any future single-send attempt needs a materially different construction path
+(for example, routing emitting the compact packet/ref layout directly), not
+incremental polishing of this two-pass prototype.

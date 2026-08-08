@@ -50,6 +50,30 @@ constexpr uint16_t CROSS_CORE_FLAG_MAX_SET_COUNT = 15;
 constexpr uint32_t INGRESS_READY_MAGIC = 0x4D000000U;
 constexpr uint32_t INGRESS_READY_MAGIC_MASK = 0xFF000000U;
 
+#ifdef DISPATCH_FFN_COMBINE_SINGLE_SEND_INGRESS
+// Stage A single-send ingress (BF16, EP2, graph-static M). Each destination
+// lane owns one hidden row per unique (source token, destination rank) pair,
+// a destination-local expert-grouped compact reference list, and an
+// independent generation-tagged ready slot. Producer core c stages and
+// publishes only lane (this rank -> c); receiver core c consumes only lane
+// (c -> this rank). The receiver pulls each lane's unique rows once into a
+// local packet buffer and expands every route ref from that local copy into
+// the unchanged expert-major GMM input, without rescanning raw M * top-k
+// metadata and without any source-wide sealed-wave publication.
+constexpr int32_t SINGLE_SEND_MAX_CORES = 128;
+constexpr int32_t SINGLE_SEND_MAX_BUCKETS = 1024;
+constexpr int32_t SINGLE_SEND_REF_META_CHUNK = 1024;
+constexpr int32_t SINGLE_SEND_REF_READ_CHUNK = 1024;
+// Stage and pull scratch start after the fixed 0..128 KiB region used by
+// CopyGMToGM; the catlass GMM pipeline does not allocate UB in this range.
+constexpr int32_t SINGLE_SEND_UB_BASE = 160 * 1024;
+#endif
+
+#if defined(DISPATCH_FFN_COMBINE_SINGLE_SEND_INGRESS) && \
+    defined(DISPATCH_FFN_COMBINE_DIRECT_INGRESS)
+#error "single-send ingress and sealed-wave direct ingress are mutually exclusive"
+#endif
+
 #if defined(DISPATCH_FFN_COMBINE_DIRECT_INGRESS_SPARSE_FALLBACK) && \
     !defined(DISPATCH_FFN_COMBINE_DIRECT_INGRESS)
 #error "direct-ingress sparse fallback requires direct ingress"
@@ -239,7 +263,7 @@ private:
             shmem.initShmem(params.symmetricPtr, params.rank, params.rankSize);
         #endif
         workspaceInfo = WorkspaceInfo(params);
-        peermemInfo = PeermemInfo(params, shmem);
+        peermemInfo = PeermemInfo(params, shmem, coreNum);
 
         cumsumMM.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t*>(workspaceInfo.ptrcumsumMM));
 
@@ -944,6 +968,352 @@ private:
     }
 #endif
 
+#ifdef DISPATCH_FFN_COMBINE_SINGLE_SEND_INGRESS
+    // Experimental Stage A single-send ingress. The routing pass first
+    // finishes with the source-owned offsetA staging region; that region is
+    // reused as the per-destination packet lane area. Each (source,
+    // destination) lane carries one hidden row per unique (token, lane) pair
+    // in its packet region, a destination-local compact ref list grouped by
+    // global expert bucket (runs in ascending route order), a unique-row
+    // count, and an independent generation-tagged ready slot.
+    //
+    // Producer: core c (c < EP) owns only outgoing lane (this rank -> c) and
+    // publishes it as soon as that lane's payload and refs are complete --
+    // there is no source-wide all-destination barrier or bulk publication.
+    // Receiver: core c consumes only incoming lane (c -> this rank), pulls
+    // the lane's unique rows once into a local packet buffer, and expands
+    // every route ref from that local copy (U remote row reads, R local
+    // layout copies) without rescanning raw M * top-k metadata.
+    CATLASS_DEVICE
+    void StageSingleSendIngress(Params const &params)
+    {
+        if (!peermemInfo.singleSendEnabled) {
+            return;
+        }
+        // Core c (c < EP) owns outgoing lane (this rank -> c); every other
+        // core is idle for this stage.
+        if (coreIdx >= static_cast<uint32_t>(params.EP)) {
+            return;
+        }
+        const int32_t dst = static_cast<int32_t>(coreIdx);
+        const int32_t m = params.problemShape.m();
+        const int32_t k = params.problemShape.k();
+        const int32_t topK = static_cast<int32_t>(params.topK);
+        const int32_t routeElements = m * topK;
+        const int32_t expertPerRank = params.expertPerRank;
+        const int32_t laneBucketBase = dst * expertPerRank;
+        const int32_t laneBucketEnd = laneBucketBase + expertPerRank;
+
+        // Scratch: expert-id chunk, per-bucket histogram, per-bucket cursor.
+        // CopyGMToGM owns the 0..128 KiB UB region; scratch starts after it.
+        const int32_t chunkBytes =
+            SINGLE_SEND_REF_META_CHUNK * sizeof(int32_t);
+        const int32_t chunkOff = SINGLE_SEND_UB_BASE;
+        const int32_t histBytes = expertPerRank * sizeof(int32_t);
+        const int32_t histOff = AlignUp(chunkOff + chunkBytes, 32);
+        const int32_t cursorOff = AlignUp(histOff + histBytes, 32);
+
+        AscendC::GlobalTensor<int32_t> expertIds;
+        expertIds.SetGlobalBuffer(
+            reinterpret_cast<__gm__ int32_t *>(params.expertIdx));
+        AscendC::LocalTensor<int32_t> chunk =
+            resource.ubBuf.template GetBufferByByte<int32_t>(chunkOff);
+        AscendC::LocalTensor<int32_t> hist =
+            resource.ubBuf.template GetBufferByByte<int32_t>(histOff);
+        AscendC::LocalTensor<int32_t> cursor =
+            resource.ubBuf.template GetBufferByByte<int32_t>(cursorOff);
+
+        // Pass 1: count this lane's routes per local expert bucket.
+        AscendC::Duplicate(hist, 0, expertPerRank);
+        for (int32_t base = 0; base < routeElements;
+             base += SINGLE_SEND_REF_META_CHUNK) {
+            const int32_t curCount =
+                min(SINGLE_SEND_REF_META_CHUNK, routeElements - base);
+            AscendC::DataCopyPad(
+                chunk, expertIds[base],
+                {1, static_cast<uint16_t>(curCount * sizeof(int32_t)), 0, 0},
+                {});
+            AscendC::SetFlag<AscendC::HardEvent::MTE2_S>(EVENT_ID0);
+            AscendC::WaitFlag<AscendC::HardEvent::MTE2_S>(EVENT_ID0);
+            for (int32_t i = 0; i < curCount; ++i) {
+                const int32_t e = chunk.GetValue(i);
+                if (e >= laneBucketBase && e < laneBucketEnd) {
+                    const int32_t b = e - laneBucketBase;
+                    hist.SetValue(b, hist.GetValue(b) + 1);
+                }
+            }
+        }
+
+        // Prefix sums turn the histogram into each bucket's ref-run base (in
+        // pairs) inside this lane's fixed block. The receiver re-derives the
+        // same bases from the exchanged count matrix.
+        {
+            int32_t running = 0;
+            for (int32_t b = 0; b < expertPerRank; ++b) {
+                cursor.SetValue(b, running);
+                running += hist.GetValue(b);
+            }
+        }
+
+        // Pass 2: pack one hidden row per unique (token, lane) pair into the
+        // lane's packet region and append (packet slot, top-k slot) ref pairs
+        // to each expert's run in ascending route order -- the exact order
+        // the expert-major GMM input and expandedRowIdx expect (the routing
+        // sort is stable within an expert).
+        AscendC::GlobalTensor<ElementA> dstPacket;
+        dstPacket.SetGlobalBuffer(reinterpret_cast<__gm__ ElementA *>(
+            shmem() + peermemInfo.offsetA +
+            dst * peermemInfo.packetStrideBytes));
+        AscendC::GlobalTensor<ElementA> srcX;
+        srcX.SetGlobalBuffer(params.ptrA);
+        __gm__ int32_t *refsGm = reinterpret_cast<__gm__ int32_t *>(
+            shmem() + peermemInfo.offsetRefs +
+            dst * peermemInfo.maxLaneRefsBytes);
+
+        int32_t uniqueRows = 0;
+        int32_t curToken = -1;
+        bool tokenSeenInLane = false;
+        for (int32_t base = 0; base < routeElements;
+             base += SINGLE_SEND_REF_META_CHUNK) {
+            const int32_t curCount =
+                min(SINGLE_SEND_REF_META_CHUNK, routeElements - base);
+            AscendC::DataCopyPad(
+                chunk, expertIds[base],
+                {1, static_cast<uint16_t>(curCount * sizeof(int32_t)), 0, 0},
+                {});
+            AscendC::SetFlag<AscendC::HardEvent::MTE2_S>(EVENT_ID0);
+            AscendC::WaitFlag<AscendC::HardEvent::MTE2_S>(EVENT_ID0);
+            for (int32_t i = 0; i < curCount; ++i) {
+                const int32_t route = base + i;
+                const int32_t e = chunk.GetValue(i);
+                if (e < laneBucketBase || e >= laneBucketEnd) {
+                    continue;
+                }
+                const int32_t tokenIdx = route / topK;
+                const int32_t topkSlot = route % topK;
+                if (tokenIdx != curToken) {
+                    curToken = tokenIdx;
+                    tokenSeenInLane = false;
+                }
+                int32_t packetSlot = 0;
+                if (!tokenSeenInLane) {
+                    tokenSeenInLane = true;
+                    packetSlot = uniqueRows;
+                    CopyGMToGM(dstPacket[packetSlot * k],
+                               srcX[tokenIdx * k], k, params.ubMoveNum);
+                    ++uniqueRows;
+                } else {
+                    packetSlot = uniqueRows - 1;
+                }
+                const int32_t b = e - laneBucketBase;
+                const int32_t pos = cursor.GetValue(b) * 2;
+                cursor.SetValue(b, cursor.GetValue(b) + 1);
+                refsGm[pos] = packetSlot;
+                refsGm[pos + 1] = topkSlot;
+            }
+        }
+
+        // Lane metadata: unique hidden rows for outgoing lane (this rank ->
+        // dst). The receiver reads it after the ready publication to size its
+        // single pull of the packet. Each lane's slot owns its cache line.
+        __gm__ int32_t *laneCounts = reinterpret_cast<__gm__ int32_t *>(
+            shmem() + peermemInfo.offsetLaneCounts);
+        laneCounts[dst * (AscendC::CACHE_LINE_SIZE / 4)] = uniqueRows;
+
+        // Scalar GM stores live in this core's cache; a remote receiver reads
+        // DRAM through its window. Force the ref and count lines to DRAM now
+        // (the ready slot below follows the same pattern), so the ready wait
+        // implies the payload is readable by the peer.
+        for (int32_t line = 0;
+             line < static_cast<int32_t>(peermemInfo.maxLaneRefsBytes) /
+                         static_cast<int32_t>(AscendC::CACHE_LINE_SIZE);
+             ++line) {
+            gm_dcci(reinterpret_cast<__gm__ uint8_t *>(
+                refsGm + line * (AscendC::CACHE_LINE_SIZE / 4)));
+        }
+        gm_dcci(reinterpret_cast<__gm__ uint8_t *>(
+            laneCounts + dst * (AscendC::CACHE_LINE_SIZE / 4)));
+
+        // Publish this lane's generation. The DDR barrier orders the packet,
+        // ref, and count payload writes before the ready store; the slot is
+        // written only by this owner core and isolated on its own cache line.
+        // No SyncAll: other lanes publish independently of this one.
+        AscendC::DataSyncBarrier<AscendC::MemDsbT::DDR>();
+        __gm__ uint32_t *lane = reinterpret_cast<__gm__ uint32_t *>(
+            shmem() + peermemInfo.offsetReady +
+            dst * AscendC::CACHE_LINE_SIZE);
+        gm_dcci(lane);
+        const uint32_t gen = gm_load(lane) + 1U;
+        gm_store(lane, gen);
+        gm_dcci(lane);
+        AscendC::DataSyncBarrier<AscendC::MemDsbT::DDR>();
+    }
+
+    CATLASS_DEVICE
+    void PullSingleSendIngress(Params const &params)
+    {
+        if (!peermemInfo.singleSendEnabled) {
+            return;
+        }
+        const int32_t rank = static_cast<int32_t>(params.rank);
+        const int32_t expertPerRank = params.expertPerRank;
+        const int32_t k = params.problemShape.k();
+
+        if (coreIdx < static_cast<uint32_t>(params.EP)) {
+            const int32_t src = static_cast<int32_t>(coreIdx);
+
+            // The expected generation comes from the local self lane, which
+            // this rank's own producer core published before the count
+            // exchange. Wait only this core's assigned lane (src -> rank)
+            // with the existing +/-1-tolerant helper; do not wait on every
+            // incoming lane.
+            __gm__ uint32_t *selfLane = reinterpret_cast<__gm__ uint32_t *>(
+                shmem() + peermemInfo.offsetReady +
+                rank * AscendC::CACHE_LINE_SIZE);
+            gm_dcci(selfLane);
+            const uint32_t expectedGen = gm_load(selfLane);
+            __gm__ uint32_t *lane = reinterpret_cast<__gm__ uint32_t *>(
+                shmem(peermemInfo.offsetReady +
+                          rank * AscendC::CACHE_LINE_SIZE,
+                      src));
+            gm_signal_wait_until_eq_for_barrier(lane, expectedGen);
+            AscendC::DataSyncBarrier<AscendC::MemDsbT::DDR>();
+
+            // Pull the lane's unique hidden rows once into this core's local
+            // packet buffer, then expand every route ref from that local
+            // copy: U remote row reads, R local layout copies.
+            __gm__ int32_t *remoteLaneCounts =
+                reinterpret_cast<__gm__ int32_t *>(
+                    shmem(peermemInfo.offsetLaneCounts, src));
+            // The ready-slot wait only refreshes the ready line; the peer
+            // laneCounts line can still be cached from routing staging or a
+            // previous wave. Invalidate it so the scalar count read sees the
+            // producer's published value, then clamp to the token count as a
+            // fail-closed guard against any residual incoherence (a stale
+            // count would size the packet pull past localPacket and corrupt
+            // the ready slots).
+            gm_dcci(reinterpret_cast<__gm__ uint8_t *>(remoteLaneCounts));
+            const int32_t uniqueRows = min(
+                remoteLaneCounts[rank * (AscendC::CACHE_LINE_SIZE / 4)],
+                static_cast<int32_t>(params.problemShape.m()));
+            AscendC::GlobalTensor<ElementA> remotePacket;
+            remotePacket.SetGlobalBuffer(reinterpret_cast<__gm__ ElementA *>(
+                shmem(peermemInfo.offsetA +
+                          rank * peermemInfo.packetStrideBytes,
+                      src)));
+            AscendC::GlobalTensor<ElementA> localPacket;
+            localPacket.SetGlobalBuffer(reinterpret_cast<__gm__ ElementA *>(
+                shmem() + peermemInfo.offsetLocalPacket +
+                src * peermemInfo.packetStrideBytes));
+            if (uniqueRows > 0) {
+                CopyGMToGM(localPacket[0], remotePacket[0],
+                           uniqueRows * k, params.ubMoveNum);
+            }
+
+            // Expand per-bucket ref runs into the unchanged expert-major GMM
+            // input. The runs live in the source's window inside the fixed
+            // block for this destination; run bases are re-derived from the
+            // exchanged count matrix, and every expanded row is a local copy
+            // from this core's packet buffer.
+            AscendC::GlobalTensor<int32_t> remoteRefs;
+            __gm__ int32_t *remoteRefsBase =
+                reinterpret_cast<__gm__ int32_t *>(shmem(
+                    peermemInfo.offsetRefs +
+                        rank * peermemInfo.maxLaneRefsBytes,
+                    src));
+            // The ready wait refreshes the ready line only; the peer's ref
+            // lines may still be cached from routing staging or a previous
+            // wave. Invalidate this rank's view so the ref reads observe the
+            // producer's flushed values.
+            for (int32_t line = 0;
+                 line < static_cast<int32_t>(peermemInfo.maxLaneRefsBytes) /
+                             static_cast<int32_t>(AscendC::CACHE_LINE_SIZE);
+                 ++line) {
+                gm_dcci(reinterpret_cast<__gm__ uint8_t *>(
+                    remoteRefsBase +
+                    line * (AscendC::CACHE_LINE_SIZE / 4)));
+            }
+            remoteRefs.SetGlobalBuffer(remoteRefsBase);
+            AscendC::LocalTensor<int32_t> refChunk =
+                resource.ubBuf.template GetBufferByByte<int32_t>(
+                    SINGLE_SEND_UB_BASE);
+
+            int32_t expandedRows = 0;
+            int32_t runOffset = 0;  // ref pairs consumed before this bucket
+            int32_t groupBase = 0;  // gmA rows before this local expert
+            for (int32_t g = 0; g < expertPerRank; ++g) {
+                int32_t within = 0;
+                int32_t total = 0;
+                for (int32_t s2 = 0; s2 < params.EP; ++s2) {
+                    const int32_t cnt = tokenPerExpert(
+                        tokenPerExpertLayout(s2, rank, g));
+                    total += cnt;
+                    if (s2 < src) {
+                        within += cnt;
+                    }
+                }
+                const int32_t dstRow = groupBase + within;
+                groupBase += total;
+
+                const int32_t expected = tokenPerExpert(
+                    tokenPerExpertLayout(src, rank, g));
+                if (expected == 0 ||
+                    dstRow >= static_cast<int32_t>(params.maxOutputSize)) {
+                    runOffset += expected;
+                    continue;
+                }
+                int32_t expect = expected;
+                if (dstRow + expect >
+                    static_cast<int32_t>(params.maxOutputSize)) {
+                    expect = static_cast<int32_t>(params.maxOutputSize) -
+                             dstRow;
+                }
+                int32_t produced = 0;
+                for (int32_t rb = 0; rb < expect;
+                     rb += SINGLE_SEND_REF_READ_CHUNK) {
+                    const int32_t cnt =
+                        min(SINGLE_SEND_REF_READ_CHUNK, expect - rb);
+                    AscendC::DataCopyPad(
+                        refChunk, remoteRefs[(runOffset + rb) * 2],
+                        {1, static_cast<uint16_t>(
+                                cnt * 2 * sizeof(int32_t)),
+                         0, 0},
+                        {});
+                    AscendC::SetFlag<AscendC::HardEvent::MTE2_S>(EVENT_ID0);
+                    AscendC::WaitFlag<AscendC::HardEvent::MTE2_S>(EVENT_ID0);
+                    for (int32_t i = 0; i < cnt; ++i) {
+                        const int32_t packetSlot = refChunk.GetValue(i * 2);
+                        // refChunk(i * 2 + 1) is the source top-k slot,
+                        // carried for the Stage B return addressing.
+                        CopyGMToGM(gmA[(dstRow + produced) * k],
+                                   localPacket[packetSlot * k], k,
+                                   params.ubMoveNum);
+                        ++produced;
+                    }
+                }
+                if (produced != expect) {
+                    trap();
+                }
+                expandedRows += produced;
+                runOffset += expected;
+            }
+
+            // Expose the U and R accounting taken from the actual copy loops:
+            // uniqueRows came out of the single packet pull, expandedRows out
+            // of the per-ref expansion copies.
+            __gm__ int32_t *stats = reinterpret_cast<__gm__ int32_t *>(
+                shmem() + peermemInfo.offsetStats);
+            stats[src * 2] = uniqueRows;
+            stats[src * 2 + 1] = expandedRows;
+        }
+
+        // Complete receiver-local packing before the GMM pipeline consumes
+        // the expert-major input.
+        AscendC::DataSyncBarrier<AscendC::MemDsbT::DDR>();
+        AscendC::SyncAll<true>();
+    }
+#endif
+
     CATLASS_DEVICE
     void UpdateAicFlags(const Params &params)
     {
@@ -1010,6 +1380,15 @@ private:
         &params.moeInitRoutingQuantV2TilingData, params.initRoutingQuantTilingKey);
 
         AscendC::SyncAll<true>();
+#ifdef DISPATCH_FFN_COMBINE_SINGLE_SEND_INGRESS
+        // Drain every core's routing-pass MTE3 staging writes before Stage
+        // reuses the [0, routingBytes) region for packets/refs/counts: the
+        // AIV SyncAll alone does not order those asynchronous stores, and a
+        // late landing write clobbers Stage's scalar stores (observed as
+        // stale bf16 x rows in the refs/laneCounts regions).
+        AscendC::DataSyncBarrier<AscendC::MemDsbT::DDR>();
+        StageSingleSendIngress(params);
+#endif
         TaggedTokenPerExpertGatherAndGetSumPreRank(params, localTokenPerExpertOffset);
 #ifdef DISPATCH_FFN_COMBINE_DIRECT_INGRESS_SPARSE_FALLBACK
         SelectDirectIngressFromPublishedPreferences(params);
@@ -1026,6 +1405,10 @@ private:
             prevSum = preSumBeforeRank(coreIdx * params.expertPerRank);
         }
         AscendC::SyncAll<true>();
+
+#ifdef DISPATCH_FFN_COMBINE_SINGLE_SEND_INGRESS
+        PullSingleSendIngress(params);
+#endif
 
 #ifdef DISPATCH_FFN_COMBINE_DIRECT_INGRESS
         if (peermemInfo.directIngressEnabled) {
@@ -1059,6 +1442,9 @@ private:
 #ifdef DISPATCH_FFN_COMBINE_DIRECT_INGRESS
             if (!peermemInfo.directIngressEnabled) {
 #endif
+#ifdef DISPATCH_FFN_COMBINE_SINGLE_SEND_INGRESS
+            if (!peermemInfo.singleSendEnabled) {
+#endif
             for(int32_t dstEpIdx = coreIdx; dstEpIdx < params.EP; dstEpIdx += coreNum) {
                 uint32_t rowStart = (dstEpIdx == 0 ? 0 : cumsumMM((dstEpIdx - 1) * params.expertPerRank + groupIdx)) + prevGroupSum1;
                 if (rowStart < params.maxOutputSize) {
@@ -1086,6 +1472,9 @@ private:
 #ifdef DISPATCH_FFN_COMBINE_DIRECT_INGRESS
             }
 #endif
+#ifdef DISPATCH_FFN_COMBINE_SINGLE_SEND_INGRESS
+            }
+#endif
             // The route counts are shared by every AIV core, so this branch is
             // uniform. An unscheduled expert has neither ingress writes nor an
             // AIC consumer: omit both its barrier and progress signal. The next
@@ -1095,8 +1484,14 @@ private:
 #ifdef DISPATCH_FFN_COMBINE_DIRECT_INGRESS
                 if (!peermemInfo.directIngressEnabled) {
 #endif
+#ifdef DISPATCH_FFN_COMBINE_SINGLE_SEND_INGRESS
+                if (!peermemInfo.singleSendEnabled) {
+#endif
                 AscendC::SyncAll<true>();
 #ifdef DISPATCH_FFN_COMBINE_DIRECT_INGRESS
+                }
+#endif
+#ifdef DISPATCH_FFN_COMBINE_SINGLE_SEND_INGRESS
                 }
 #endif
                 AscendC::CrossCoreSetFlag<0x2, PIPE_MTE3>(
@@ -1217,6 +1612,8 @@ private:
             kernelMoeTokenUnpermuteOp.Init(shmem() + peermemInfo.offsetD, workspaceInfo.expandedRowIdx, params.probs, reinterpret_cast<GM_ADDR>(params.ptrOutput), &tilingData);
             kernelMoeTokenUnpermuteOp.Process();
         }
+
+
 
     }
 
@@ -1349,17 +1746,25 @@ private:
         int64_t offsetA;
         int64_t offsetDirectA;
         int64_t offsetDirectIngressReady;
+        int64_t offsetLaneCounts;
+        int64_t offsetRefs;
+        int64_t offsetReady;
+        int64_t offsetStats;
+        int64_t packetStrideBytes;
+        int64_t maxLaneRefsBytes;
+        int64_t offsetLocalPacket;
         int64_t directInputBytes;
         int64_t offsetPeerPerTokenScale;
         int64_t offsetPeerTokenPerExpert;
         int64_t offsetD;
         bool directIngressEnabled;
+        bool singleSendEnabled;
 
         CATLASS_DEVICE
         PeermemInfo(){}
 
         CATLASS_DEVICE
-        PeermemInfo(const Params & params, const HcclShmem & shmem) {
+        PeermemInfo(const Params & params, const HcclShmem & shmem, int32_t coreNum_) {
             offsetA = 0;
             offsetPeerPerTokenScale = offsetA + AlignUp(shmem.SegmentSize() / 3, 512);
             offsetD = offsetPeerPerTokenScale + MB_SIZE;
@@ -1380,6 +1785,68 @@ private:
                 AscendC::CACHE_LINE_SIZE);
             directInputBytes = 0;
             directIngressEnabled = false;
+            singleSendEnabled = false;
+#ifdef DISPATCH_FFN_COMBINE_SINGLE_SEND_INGRESS
+            // The offsetA region (the routing pass's staging area) is reused
+            // as the per-destination packet lane area: outPacket[dst] for
+            // each outgoing lane, followed by the per-receiver-core local
+            // pull buffer localPacket[c]. The lane count array, the fixed
+            // per-dst ref blocks, a write-only stats area, and the
+            // per-(src, dst) ready slots follow, all inside the peer-window
+            // gap before the per-token scale region. Every offset is
+            // graph-static; only the number of touched packet rows
+            // (laneCounts) varies per wave.
+            const int64_t singleSendBucketCount =
+                static_cast<int64_t>(params.EP) * params.expertPerRank;
+            packetStrideBytes = AlignUp(
+                static_cast<int64_t>(params.problemShape.m()) *
+                    params.problemShape.k() * sizeof(ElementA),
+                512);
+            offsetLocalPacket =
+                offsetA + static_cast<int64_t>(params.EP) * packetStrideBytes;
+            offsetLaneCounts = AlignUp(
+                offsetLocalPacket +
+                    static_cast<int64_t>(params.EP) * packetStrideBytes,
+                512);
+            // One hardware cache line per lane: the two producer cores write
+            // distinct int32 slots, and two scalar stores to one shared line
+            // race (last flush wins for the whole line). Line-isolate so each
+            // lane's count is written and flushed independently.
+            const int64_t laneCountsBytes = static_cast<int64_t>(
+                params.EP) * AscendC::CACHE_LINE_SIZE;
+            offsetRefs = AlignUp(offsetLaneCounts + laneCountsBytes, 512);
+            maxLaneRefsBytes = AlignUp(
+                static_cast<int64_t>(params.problemShape.m()) * params.topK *
+                    2 * sizeof(int32_t),
+                512);
+            const int64_t refsBytes =
+                static_cast<int64_t>(params.EP) * maxLaneRefsBytes;
+            offsetStats = AlignUp(offsetRefs + refsBytes, 512);
+            const int64_t statsBytes = AlignUp(
+                static_cast<int64_t>(params.EP) * 2 * sizeof(int32_t), 512);
+            // moe_init_routing_v2 rewrites the expanded routing staging from
+            // offsetA = 0 over routingBytes = M * topK * K * ElementA. The
+            // generation ready slots perform a persistent load-increment-store
+            // across waves, so they must live beyond that worst-case routing
+            // extent -- not merely after the packet/ref/count scratch, which
+            // Stage reconstructs after routing (the trailing SyncAll/barrier
+            // already protects the inter-replay lifetime). The guard below
+            // fails closed if the peer window cannot hold the layout.
+            const int64_t routingBytes =
+                static_cast<int64_t>(params.problemShape.m()) * params.topK *
+                params.problemShape.k() * sizeof(ElementA);
+            offsetReady = AlignUp(
+                max(offsetStats + statsBytes, offsetA + routingBytes),
+                AscendC::CACHE_LINE_SIZE);
+            const int64_t readyBytes =
+                static_cast<int64_t>(params.EP) * AscendC::CACHE_LINE_SIZE;
+            singleSendEnabled = params.EP == 2 &&
+                params.rank < static_cast<uint32_t>(params.EP) &&
+                coreNum_ >= static_cast<uint32_t>(params.EP) &&
+                coreNum_ <= SINGLE_SEND_MAX_CORES &&
+                singleSendBucketCount <= SINGLE_SEND_MAX_BUCKETS &&
+                offsetReady + readyBytes <= offsetPeerPerTokenScale;
+#endif
 #ifdef DISPATCH_FFN_COMBINE_DIRECT_INGRESS
             // maxOutputSize is a policy capacity (131072 in the production
             // wrapper), not the number of rows this invocation can produce.
