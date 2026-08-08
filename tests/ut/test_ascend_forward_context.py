@@ -19,12 +19,14 @@ from vllm_ascend.ascend_forward_context import (
     MoEForwardPhase,
     _select_moe_comm_method_stock,
     classify_forward_phase,
+    get_moe_phase_hybrid_warmup_phase,
     get_mrv2_in_profile_run,
     is_moe_phase_hybrid_active,
     override_mrv2_in_profile_run,
     select_moe_comm_method,
     set_ascend_forward_context,
-    should_bypass_compiled_for_moe_phase_hybrid,
+    should_force_eager_for_moe_phase_hybrid,
+    should_skip_compiled_for_moe_phase_hybrid,
     validate_moe_phase_hybrid_policy,
 )
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
@@ -242,12 +244,12 @@ def _make_hybrid_moe_config(
     return cfg
 
 
-def test_is_moe_phase_hybrid_active_mixed_only():
-    """Only MIXED is hybrid-active; PURE_PREFILL is deliberately excluded."""
-    vllm_config = _with_hybrid_policy(_make_hybrid_moe_config(8, num_experts=64), "mixed_prefill_fused")
+def test_is_moe_phase_hybrid_active_non_decode_only():
+    """PURE_PREFILL and MIXED are hybrid-active; PURE_DECODE is excluded."""
+    vllm_config = _with_hybrid_policy(_make_hybrid_moe_config(8, num_experts=64), "non_decode_fused")
     with patch("vllm_ascend.ascend_forward_context.is_moe_model", return_value=True):
+        assert is_moe_phase_hybrid_active(MoEForwardPhase.PURE_PREFILL, vllm_config) is True
         assert is_moe_phase_hybrid_active(MoEForwardPhase.MIXED, vllm_config) is True
-        assert is_moe_phase_hybrid_active(MoEForwardPhase.PURE_PREFILL, vllm_config) is False
         assert is_moe_phase_hybrid_active(MoEForwardPhase.PURE_DECODE, vllm_config) is False
         assert is_moe_phase_hybrid_active(None, vllm_config) is False
         # Draft model never hybrid-active (drafter keeps stock comm path).
@@ -256,32 +258,98 @@ def test_is_moe_phase_hybrid_active_mixed_only():
             assert is_moe_phase_hybrid_active(MoEForwardPhase.MIXED, vllm_config) is False
 
 
-def test_should_bypass_compiled_for_moe_phase_hybrid_truth_table():
-    """PURE_PREFILL and MIXED both bypass the compiled model under the
-    policy; decode never does. PURE_PREFILL keeps the baseline comm family
-    but must not reuse a decode-compiled artifact."""
-    vllm_config = _with_hybrid_policy(_make_hybrid_moe_config(8, num_experts=64), "mixed_prefill_fused")
+def test_should_skip_compiled_for_moe_phase_hybrid_decode_only():
+    """skip_compiled under the policy applies ONLY to PURE_DECODE: decode
+    runs the raw baseline comm ops so FULL_DECODE_ONLY ACL graphs capture and
+    replay exactly those raw ops. PURE_PREFILL/MIXED keep the compiled
+    (fused torch.compile) path."""
+    vllm_config = _with_hybrid_policy(_make_hybrid_moe_config(8, num_experts=64), "non_decode_fused")
     with patch("vllm_ascend.ascend_forward_context.is_moe_model", return_value=True):
-        assert should_bypass_compiled_for_moe_phase_hybrid(MoEForwardPhase.MIXED, vllm_config) is True
-        assert should_bypass_compiled_for_moe_phase_hybrid(MoEForwardPhase.PURE_PREFILL, vllm_config) is True
-        assert should_bypass_compiled_for_moe_phase_hybrid(MoEForwardPhase.PURE_DECODE, vllm_config) is False
-        assert should_bypass_compiled_for_moe_phase_hybrid(None, vllm_config) is False
+        assert should_skip_compiled_for_moe_phase_hybrid(MoEForwardPhase.PURE_DECODE, vllm_config) is True
+        assert should_skip_compiled_for_moe_phase_hybrid(MoEForwardPhase.PURE_PREFILL, vllm_config) is False
+        assert should_skip_compiled_for_moe_phase_hybrid(MoEForwardPhase.MIXED, vllm_config) is False
+        assert should_skip_compiled_for_moe_phase_hybrid(None, vllm_config) is False
         assert (
-            should_bypass_compiled_for_moe_phase_hybrid(MoEForwardPhase.PURE_PREFILL, vllm_config, is_draft_model=True)
+            should_skip_compiled_for_moe_phase_hybrid(MoEForwardPhase.PURE_DECODE, vllm_config, is_draft_model=True)
             is False
         )
         with patch("vllm_ascend.ascend_forward_context.is_moe_model", return_value=False):
-            assert should_bypass_compiled_for_moe_phase_hybrid(MoEForwardPhase.MIXED, vllm_config) is False
+            assert should_skip_compiled_for_moe_phase_hybrid(MoEForwardPhase.PURE_DECODE, vllm_config) is False
     off_config = _with_hybrid_policy(_make_hybrid_moe_config(8, num_experts=64), "off")
     with patch("vllm_ascend.ascend_forward_context.is_moe_model", return_value=True):
-        assert should_bypass_compiled_for_moe_phase_hybrid(MoEForwardPhase.PURE_PREFILL, off_config) is False
-        assert should_bypass_compiled_for_moe_phase_hybrid(MoEForwardPhase.MIXED, off_config) is False
+        assert should_skip_compiled_for_moe_phase_hybrid(MoEForwardPhase.PURE_DECODE, off_config) is False
+        assert should_skip_compiled_for_moe_phase_hybrid(MoEForwardPhase.PURE_PREFILL, off_config) is False
+
+
+def test_should_force_eager_for_moe_phase_hybrid_non_decode_only():
+    """force_eager under the policy applies ONLY to PURE_PREFILL and MIXED:
+    non-decode waves must never be dispatched into (or replayed from) a
+    FULL template, even when uniform_decode misclassifies a 1-token prefill.
+    PURE_DECODE keeps force_eager=False so FULL capture/replay proceeds."""
+    vllm_config = _with_hybrid_policy(_make_hybrid_moe_config(8, num_experts=64), "non_decode_fused")
+    with patch("vllm_ascend.ascend_forward_context.is_moe_model", return_value=True):
+        assert should_force_eager_for_moe_phase_hybrid(MoEForwardPhase.PURE_PREFILL, vllm_config) is True
+        assert should_force_eager_for_moe_phase_hybrid(MoEForwardPhase.MIXED, vllm_config) is True
+        assert should_force_eager_for_moe_phase_hybrid(MoEForwardPhase.PURE_DECODE, vllm_config) is False
+        assert should_force_eager_for_moe_phase_hybrid(None, vllm_config) is False
+        assert (
+            should_force_eager_for_moe_phase_hybrid(MoEForwardPhase.MIXED, vllm_config, is_draft_model=True) is False
+        )
+        with patch("vllm_ascend.ascend_forward_context.is_moe_model", return_value=False):
+            assert should_force_eager_for_moe_phase_hybrid(MoEForwardPhase.MIXED, vllm_config) is False
+    off_config = _with_hybrid_policy(_make_hybrid_moe_config(8, num_experts=64), "off")
+    with patch("vllm_ascend.ascend_forward_context.is_moe_model", return_value=True):
+        assert should_force_eager_for_moe_phase_hybrid(MoEForwardPhase.MIXED, off_config) is False
+        assert should_force_eager_for_moe_phase_hybrid(MoEForwardPhase.PURE_PREFILL, off_config) is False
+
+
+def test_moe_phase_hybrid_2x2_matrix_invariant():
+    """The two phase-keyed decisions are independent and never combine.
+
+    Under the policy each phase gets exactly one of the two controls:
+    PURE_DECODE -> (skip_compiled=True, force_eager=False); PURE_PREFILL /
+    MIXED -> (skip_compiled=False, force_eager=True). skip_compiled is never
+    fed into force_eager. Policy off and phase=None get neither control.
+    """
+    vllm_config = _with_hybrid_policy(_make_hybrid_moe_config(8, num_experts=64), "non_decode_fused")
+    with patch("vllm_ascend.ascend_forward_context.is_moe_model", return_value=True):
+        for phase, expected_skip, expected_eager in [
+            (MoEForwardPhase.PURE_DECODE, True, False),
+            (MoEForwardPhase.PURE_PREFILL, False, True),
+            (MoEForwardPhase.MIXED, False, True),
+            (None, False, False),
+        ]:
+            skip = should_skip_compiled_for_moe_phase_hybrid(phase, vllm_config)
+            eager = should_force_eager_for_moe_phase_hybrid(phase, vllm_config)
+            assert skip is expected_skip, f"phase={phase} skip_compiled"
+            assert eager is expected_eager, f"phase={phase} force_eager"
+            assert not (skip and eager), f"phase={phase} combines both controls"
+    off_config = _with_hybrid_policy(_make_hybrid_moe_config(8, num_experts=64), "off")
+    with patch("vllm_ascend.ascend_forward_context.is_moe_model", return_value=True):
+        for phase in MoEForwardPhase:
+            assert should_skip_compiled_for_moe_phase_hybrid(phase, off_config) is False
+            assert should_force_eager_for_moe_phase_hybrid(phase, off_config) is False
+
+
+def test_get_moe_phase_hybrid_warmup_phase():
+    """Profile/compile warmups get an explicit non-decode phase only under
+    the active policy; otherwise the caller keeps its historical default."""
+    vllm_config = _with_hybrid_policy(_make_hybrid_moe_config(8, num_experts=64), "non_decode_fused")
+    with patch("vllm_ascend.ascend_forward_context.is_moe_model", return_value=True):
+        assert get_moe_phase_hybrid_warmup_phase(vllm_config) is MoEForwardPhase.MIXED
+        assert get_moe_phase_hybrid_warmup_phase(vllm_config, is_draft_model=True) is None
+    with patch("vllm_ascend.ascend_forward_context.is_moe_model", return_value=False):
+        assert get_moe_phase_hybrid_warmup_phase(vllm_config) is None
+    off_config = _with_hybrid_policy(_make_hybrid_moe_config(8, num_experts=64), "off")
+    with patch("vllm_ascend.ascend_forward_context.is_moe_model", return_value=True):
+        assert get_moe_phase_hybrid_warmup_phase(off_config) is None
 
 
 def test_is_moe_phase_hybrid_active_off_policy():
     vllm_config = _with_hybrid_policy(_make_hybrid_moe_config(8, num_experts=64), "off")
     with patch("vllm_ascend.ascend_forward_context.is_moe_model", return_value=True):
         assert is_moe_phase_hybrid_active(MoEForwardPhase.MIXED, vllm_config) is False
+        assert is_moe_phase_hybrid_active(MoEForwardPhase.PURE_PREFILL, vllm_config) is False
 
 
 def test_validate_moe_phase_hybrid_policy_off_passes_everything():
@@ -303,7 +371,7 @@ def test_validate_moe_phase_hybrid_policy_off_passes_everything():
 def test_validate_moe_phase_hybrid_policy_fail_closed_fused_mc2_disabled(enable_fused_mc2):
     """The fused impl and NZ weights only exist with enable_fused_mc2==1;
     without it the policy would silently stay on the baseline family."""
-    vllm_config = _with_hybrid_policy(_make_hybrid_moe_config(8, num_experts=64), "mixed_prefill_fused")
+    vllm_config = _with_hybrid_policy(_make_hybrid_moe_config(8, num_experts=64), "non_decode_fused")
     with (
         patch(
             "vllm_ascend.ascend_forward_context.get_ascend_config",
@@ -315,7 +383,7 @@ def test_validate_moe_phase_hybrid_policy_fail_closed_fused_mc2_disabled(enable_
 
 
 def test_validate_moe_phase_hybrid_policy_fail_closed_dp():
-    vllm_config = _with_hybrid_policy(_make_hybrid_moe_config(8, num_experts=64, dp_size=2), "mixed_prefill_fused")
+    vllm_config = _with_hybrid_policy(_make_hybrid_moe_config(8, num_experts=64, dp_size=2), "non_decode_fused")
     with (
         patch("vllm_ascend.ascend_forward_context.get_ascend_config", return_value=SimpleNamespace(enable_fused_mc2=1)),
         pytest.raises(ValueError, match="data_parallel_size == 1"),
@@ -324,7 +392,7 @@ def test_validate_moe_phase_hybrid_policy_fail_closed_dp():
 
 
 def test_validate_moe_phase_hybrid_policy_fail_closed_v2():
-    vllm_config = _with_hybrid_policy(_make_hybrid_moe_config(8, num_experts=64, use_v2=True), "mixed_prefill_fused")
+    vllm_config = _with_hybrid_policy(_make_hybrid_moe_config(8, num_experts=64, use_v2=True), "non_decode_fused")
     with (
         patch("vllm_ascend.ascend_forward_context.get_ascend_config", return_value=SimpleNamespace(enable_fused_mc2=1)),
         pytest.raises(ValueError, match="V2 model runner"),
@@ -343,7 +411,7 @@ def test_validate_moe_phase_hybrid_policy_fail_closed_v2():
 )
 def test_validate_moe_phase_hybrid_policy_fail_closed_mode(mode):
     vllm_config = _with_hybrid_policy(
-        _make_hybrid_moe_config(8, num_experts=64, cudagraph_mode=mode), "mixed_prefill_fused"
+        _make_hybrid_moe_config(8, num_experts=64, cudagraph_mode=mode), "non_decode_fused"
     )
     with (
         patch("vllm_ascend.ascend_forward_context.get_ascend_config", return_value=SimpleNamespace(enable_fused_mc2=1)),
@@ -353,7 +421,7 @@ def test_validate_moe_phase_hybrid_policy_fail_closed_mode(mode):
 
 
 def test_validate_moe_phase_hybrid_policy_full_decode_only_passes():
-    vllm_config = _with_hybrid_policy(_make_hybrid_moe_config(8, num_experts=64), "mixed_prefill_fused")
+    vllm_config = _with_hybrid_policy(_make_hybrid_moe_config(8, num_experts=64), "non_decode_fused")
     with (
         patch("vllm_ascend.ascend_forward_context.get_ascend_config", return_value=SimpleNamespace(enable_fused_mc2=1)),
     ):
@@ -395,72 +463,98 @@ def test_select_moe_comm_method_hybrid_off_identical_for_all_phases():
 
 
 def test_select_moe_comm_method_hybrid_a2_tp2_experiment():
-    """A2 TP2 experiment (EP=2, enable_fused_mc2=1): decode and pure prefill
-    must select the baseline ALLGATHER -- NOT the stock FUSED_MC2 -- while
-    MIXED selects FUSED_MC2. This is the core regression for the decode
+    """A2 TP2 experiment (EP=2, enable_fused_mc2=1): decode must select the
+    baseline ALLGATHER -- NOT the stock FUSED_MC2 -- while PURE_PREFILL and
+    MIXED select FUSED_MC2. This is the core regression for the decode
     baseline blocker."""
-    vllm_config = _with_hybrid_policy(_make_hybrid_moe_config(2, num_experts=16), "mixed_prefill_fused")
+    vllm_config = _with_hybrid_policy(_make_hybrid_moe_config(2, num_experts=16), "non_decode_fused")
     with _patches(*_a2_selector_env(1, 2)):
         assert select_moe_comm_method(32, vllm_config, phase=MoEForwardPhase.PURE_DECODE) is MoECommType.ALLGATHER
-        assert select_moe_comm_method(32, vllm_config, phase=MoEForwardPhase.PURE_PREFILL) is MoECommType.ALLGATHER
+        assert select_moe_comm_method(32, vllm_config, phase=MoEForwardPhase.PURE_PREFILL) is MoECommType.FUSED_MC2
         assert select_moe_comm_method(32, vllm_config, phase=MoEForwardPhase.MIXED) is MoECommType.FUSED_MC2
         # Stock would have picked FUSED_MC2 for decode here; the policy must
         # not leak fused into the decode path.
         assert _select_moe_comm_method_stock(32, vllm_config) is MoECommType.FUSED_MC2
 
 
-def test_select_moe_comm_method_hybrid_a2_fused_disabled():
-    """A2 enable_fused_mc2=0: baseline == stock == ALLGATHER for every phase."""
-    vllm_config = _with_hybrid_policy(_make_hybrid_moe_config(2, num_experts=16), "mixed_prefill_fused")
+def test_select_moe_comm_method_hybrid_a2_fused_disabled_fail_fast():
+    """A2 enable_fused_mc2=0: decode keeps the baseline ALLGATHER, but a
+    non-decode phase must NEVER fall back to baseline -- the selector raises
+    fail-fast because the static fused gate is unavailable."""
+    vllm_config = _with_hybrid_policy(_make_hybrid_moe_config(2, num_experts=16), "non_decode_fused")
     with _patches(*_a2_selector_env(0, 2)):
-        for phase in MoEForwardPhase:
-            assert select_moe_comm_method(32, vllm_config, phase=phase) is MoECommType.ALLGATHER
+        assert select_moe_comm_method(32, vllm_config, phase=MoEForwardPhase.PURE_DECODE) is MoECommType.ALLGATHER
+        for phase in (MoEForwardPhase.PURE_PREFILL, MoEForwardPhase.MIXED):
+            with pytest.raises(ValueError, match="requires the static fused-MC2 capability gate"):
+                select_moe_comm_method(32, vllm_config, phase=phase)
 
 
-def test_select_moe_comm_method_hybrid_a2_fused_gate_fails_closes_to_baseline():
-    """A2 EP=16 is beyond the fused gate (EP<=8): MIXED fails closed to the
-    baseline MC2 family, identical to decode/pure-prefill."""
-    vllm_config = _with_hybrid_policy(_make_hybrid_moe_config(16, num_experts=128), "mixed_prefill_fused")
+def test_select_moe_comm_method_hybrid_a2_gate_fails_fail_fast():
+    """A2 EP=16 is beyond the fused gate (EP<=8): decode keeps the baseline
+    MC2 family, but PURE_PREFILL and MIXED raise fail-fast instead of
+    falling back to it (a baseline non-decode wave inside the single fused
+    lane is exactly the stale-template failure the policy prevents)."""
+    vllm_config = _with_hybrid_policy(_make_hybrid_moe_config(16, num_experts=128), "non_decode_fused")
     with _patches(*_a2_selector_env(1, 16)):
         # baseline: experts/device=8 <= 24, EP>=16, tokens within capacity -> MC2
         assert select_moe_comm_method(32, vllm_config, phase=MoEForwardPhase.PURE_DECODE) is MoECommType.MC2
-        assert select_moe_comm_method(32, vllm_config, phase=MoEForwardPhase.MIXED) is MoECommType.MC2
+        for phase in (MoEForwardPhase.PURE_PREFILL, MoEForwardPhase.MIXED):
+            with pytest.raises(ValueError, match="requires the static fused-MC2 capability gate"):
+                select_moe_comm_method(32, vllm_config, phase=phase)
+    # Policy OFF in the same unsupported environment stays stock (no raise).
+    off_config = _with_hybrid_policy(_make_hybrid_moe_config(16, num_experts=128), "off")
+    with _patches(*_a2_selector_env(1, 16)):
+        assert select_moe_comm_method(32, off_config, phase=MoEForwardPhase.PURE_PREFILL) is MoECommType.MC2
 
 
 def test_select_moe_comm_method_hybrid_a3_decode_baseline_not_stock_fused():
     """A3 enable_fused_mc2==1, EP<=32, within capacity: stock decode would be
-    FUSED_MC2, but the policy must select the baseline MC2 for decode and pure
-    prefill; only MIXED is fused."""
-    vllm_config = _with_hybrid_policy(_make_hybrid_moe_config(8, num_experts=64), "mixed_prefill_fused")
+    FUSED_MC2, but the policy must select the baseline MC2 for decode, while
+    PURE_PREFILL and MIXED select FUSED_MC2."""
+    vllm_config = _with_hybrid_policy(_make_hybrid_moe_config(8, num_experts=64), "non_decode_fused")
     with _patches(*_a3_selector_env(1, 8)):
         assert _select_moe_comm_method_stock(32, vllm_config) is MoECommType.FUSED_MC2
         assert select_moe_comm_method(32, vllm_config, phase=MoEForwardPhase.PURE_DECODE) is MoECommType.MC2
-        assert select_moe_comm_method(32, vllm_config, phase=MoEForwardPhase.PURE_PREFILL) is MoECommType.MC2
+        assert select_moe_comm_method(32, vllm_config, phase=MoEForwardPhase.PURE_PREFILL) is MoECommType.FUSED_MC2
         assert select_moe_comm_method(32, vllm_config, phase=MoEForwardPhase.MIXED) is MoECommType.FUSED_MC2
 
 
 def test_select_moe_comm_method_hybrid_a3_capacity_beyond():
-    """A3 beyond MC2 capacity: baseline is ALLTOALL; MIXED stays fused."""
-    vllm_config = _with_hybrid_policy(_make_hybrid_moe_config(8, num_experts=64), "mixed_prefill_fused")
+    """A3 beyond MC2 capacity: decode baseline is ALLTOALL; non-decode stays
+    fused."""
+    vllm_config = _with_hybrid_policy(_make_hybrid_moe_config(8, num_experts=64), "non_decode_fused")
     with _patches(*_a3_selector_env(1, 8)):
         assert select_moe_comm_method(128, vllm_config, phase=MoEForwardPhase.PURE_DECODE) is MoECommType.ALLTOALL
-        assert select_moe_comm_method(128, vllm_config, phase=MoEForwardPhase.PURE_PREFILL) is MoECommType.ALLTOALL
+        assert select_moe_comm_method(128, vllm_config, phase=MoEForwardPhase.PURE_PREFILL) is MoECommType.FUSED_MC2
         assert select_moe_comm_method(128, vllm_config, phase=MoEForwardPhase.MIXED) is MoECommType.FUSED_MC2
 
 
-def test_select_moe_comm_method_hybrid_a3_enable_fused_mc2_eq_2_fails_closed():
-    """A3 enable_fused_mc2==2 is outside the MIXED gate (==1 required): every
-    phase selects the baseline family."""
-    vllm_config = _with_hybrid_policy(_make_hybrid_moe_config(8, num_experts=64), "mixed_prefill_fused")
+def test_select_moe_comm_method_hybrid_a3_enable_fused_mc2_eq_2_fail_fast():
+    """A3 enable_fused_mc2==2 is outside the non-decode gate (==1 required):
+    decode keeps the baseline MC2, but non-decode phases raise fail-fast."""
+    vllm_config = _with_hybrid_policy(_make_hybrid_moe_config(8, num_experts=64), "non_decode_fused")
     with _patches(*_a3_selector_env(2, 8)):
         assert select_moe_comm_method(32, vllm_config, phase=MoEForwardPhase.PURE_DECODE) is MoECommType.MC2
-        assert select_moe_comm_method(32, vllm_config, phase=MoEForwardPhase.PURE_PREFILL) is MoECommType.MC2
-        assert select_moe_comm_method(32, vllm_config, phase=MoEForwardPhase.MIXED) is MoECommType.MC2
+        for phase in (MoEForwardPhase.PURE_PREFILL, MoEForwardPhase.MIXED):
+            with pytest.raises(ValueError, match="requires the static fused-MC2 capability gate"):
+                select_moe_comm_method(32, vllm_config, phase=phase)
 
 
-def test_select_moe_comm_method_hybrid_a5_identical_to_stock():
-    """A5 has no fused branch: baseline == stock for every phase."""
-    vllm_config = _with_hybrid_policy(_make_hybrid_moe_config(4, num_experts=64), "mixed_prefill_fused")
+def test_select_moe_comm_method_hybrid_a3_ep_beyond_gate_fail_fast():
+    """A3 EP=64 exceeds the dispatch_ffn_combine gate (EP<=32): decode keeps
+    the baseline MC2 family, non-decode raises fail-fast."""
+    vllm_config = _with_hybrid_policy(_make_hybrid_moe_config(64, num_experts=512), "non_decode_fused")
+    with _patches(*_a3_selector_env(1, 64)):
+        assert select_moe_comm_method(32, vllm_config, phase=MoEForwardPhase.PURE_DECODE) is MoECommType.MC2
+        for phase in (MoEForwardPhase.PURE_PREFILL, MoEForwardPhase.MIXED):
+            with pytest.raises(ValueError, match="requires the static fused-MC2 capability gate"):
+                select_moe_comm_method(32, vllm_config, phase=phase)
+
+
+def test_select_moe_comm_method_hybrid_a5_decode_stock_non_decode_fail_fast():
+    """A5 has no fused branch: decode keeps stock/baseline, but non-decode
+    phases under the policy raise fail-fast (never a baseline fallback)."""
+    vllm_config = _with_hybrid_policy(_make_hybrid_moe_config(4, num_experts=64), "non_decode_fused")
     ep_group = SimpleNamespace(world_size=4)
     ascend_config = SimpleNamespace(enable_fused_mc2=1)
     with (
@@ -471,12 +565,14 @@ def test_select_moe_comm_method_hybrid_a5_identical_to_stock():
         patch("vllm_ascend.ascend_forward_context.get_ascend_config", return_value=ascend_config),
     ):
         stock = select_moe_comm_method(32, vllm_config)
-        for phase in MoEForwardPhase:
-            assert select_moe_comm_method(32, vllm_config, phase=phase) is stock
+        assert select_moe_comm_method(32, vllm_config, phase=MoEForwardPhase.PURE_DECODE) is stock
+        for phase in (MoEForwardPhase.PURE_PREFILL, MoEForwardPhase.MIXED):
+            with pytest.raises(ValueError, match="requires the static fused-MC2 capability gate"):
+                select_moe_comm_method(32, vllm_config, phase=phase)
 
 
 def test_select_moe_comm_method_hybrid_non_moe_returns_none():
-    vllm_config = _with_hybrid_policy(_make_hybrid_moe_config(8, num_experts=64), "mixed_prefill_fused")
+    vllm_config = _with_hybrid_policy(_make_hybrid_moe_config(8, num_experts=64), "non_decode_fused")
     with (
         patch("vllm_ascend.ascend_forward_context.is_moe_model", return_value=False),
         patch("vllm_ascend.ascend_forward_context.get_ascend_device_type", return_value=AscendDeviceType.A3),
@@ -486,7 +582,7 @@ def test_select_moe_comm_method_hybrid_non_moe_returns_none():
 
 def test_select_moe_comm_method_hybrid_draft_model_stock():
     """Draft models are outside the hybrid envelope: always stock."""
-    vllm_config = _with_hybrid_policy(_make_hybrid_moe_config(8, num_experts=64), "mixed_prefill_fused")
+    vllm_config = _with_hybrid_policy(_make_hybrid_moe_config(8, num_experts=64), "non_decode_fused")
     with _patches(*_a3_selector_env(1, 8)):
         draft_prefill = select_moe_comm_method(32, vllm_config, is_draft_model=True, phase=MoEForwardPhase.MIXED)
         assert draft_prefill is MoECommType.FUSED_MC2  # stock (A3==1 within capacity), phase ignored
@@ -498,7 +594,7 @@ def test_select_moe_comm_method_hybrid_draft_model_stock():
 
 def test_select_moe_comm_method_hybrid_phase_none_stock():
     """Legacy callers without a phase keep stock selection."""
-    vllm_config = _with_hybrid_policy(_make_hybrid_moe_config(8, num_experts=64), "mixed_prefill_fused")
+    vllm_config = _with_hybrid_policy(_make_hybrid_moe_config(8, num_experts=64), "non_decode_fused")
     with _patches(*_a3_selector_env(1, 8)):
         assert select_moe_comm_method(32, vllm_config) is MoECommType.FUSED_MC2  # stock
 
@@ -528,19 +624,21 @@ def _make_forward_context_mocks():
 
 
 @pytest.mark.parametrize(
-    ("policy_value", "phase", "expected_skip_compiled"),
+    ("policy_value", "phase", "expected_skip_compiled", "expected_comm"),
     [
-        ("off", MoEForwardPhase.PURE_PREFILL, False),
-        ("off", MoEForwardPhase.MIXED, False),
-        ("mixed_prefill_fused", MoEForwardPhase.PURE_DECODE, False),
-        ("mixed_prefill_fused", MoEForwardPhase.PURE_PREFILL, True),
-        ("mixed_prefill_fused", MoEForwardPhase.MIXED, True),
-        ("mixed_prefill_fused", None, False),
+        ("off", MoEForwardPhase.PURE_DECODE, False, MoECommType.FUSED_MC2),
+        ("off", MoEForwardPhase.PURE_PREFILL, False, MoECommType.FUSED_MC2),
+        ("off", MoEForwardPhase.MIXED, False, MoECommType.FUSED_MC2),
+        ("non_decode_fused", MoEForwardPhase.PURE_DECODE, True, MoECommType.MC2),
+        ("non_decode_fused", MoEForwardPhase.PURE_PREFILL, False, MoECommType.FUSED_MC2),
+        ("non_decode_fused", MoEForwardPhase.MIXED, False, MoECommType.FUSED_MC2),
+        ("non_decode_fused", None, False, MoECommType.FUSED_MC2),
     ],
 )
-def test_set_ascend_forward_context_hybrid_skip_compiled(policy_value, phase, expected_skip_compiled):
-    """skip_compiled=True under the policy for PURE_PREFILL and MIXED (decode
-    is the only compiled path); decode keeps stock compiled behavior."""
+def test_set_ascend_forward_context_hybrid_skip_compiled(policy_value, phase, expected_skip_compiled, expected_comm):
+    """skip_compiled=True under the policy ONLY for PURE_DECODE, so the
+    FULL_DECODE_ONLY ACL graphs capture raw baseline ops. PURE_PREFILL/MIXED
+    keep the compiled (fused torch.compile) path and select FUSED_MC2."""
     captured = {}
 
     @contextmanager
@@ -564,10 +662,6 @@ def test_set_ascend_forward_context_hybrid_skip_compiled(policy_value, phase, ex
         pass
 
     assert captured["skip_compiled"] is expected_skip_compiled
-    # Comm family follows the selector: MIXED fused, decode/pure-prefill baseline.
-    if phase is MoEForwardPhase.MIXED and policy_value == "mixed_prefill_fused":
-        assert forward_context.moe_comm_type is MoECommType.FUSED_MC2
-    elif phase in (MoEForwardPhase.PURE_DECODE, MoEForwardPhase.PURE_PREFILL) and policy_value == "mixed_prefill_fused":
-        assert forward_context.moe_comm_type is MoECommType.MC2  # A3 baseline within capacity
-    else:
-        assert forward_context.moe_comm_type is MoECommType.FUSED_MC2  # stock (A3==1 within capacity)
+    # Comm family follows the selector: PURE_DECODE -> baseline (A3 MC2
+    # within capacity), PURE_PREFILL/MIXED -> FUSED_MC2, off/None -> stock.
+    assert forward_context.moe_comm_type is expected_comm

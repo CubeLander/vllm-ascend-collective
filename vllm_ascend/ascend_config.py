@@ -31,19 +31,31 @@ class MoEPhaseHybridPolicy(Enum):
     ``OFF`` keeps the stock selector byte-for-byte: forward phase is ignored
     and no graph/dispatch behavior changes.
 
-    ``MIXED_PREFILL_FUSED`` is the single supported experimental value: only
-    the ``MIXED`` forward phase (at least one request prefilling alongside
-    requests that already have computed tokens) may select
-    ``MoECommType.FUSED_MC2`` and bypass the compiled model
-    (``skip_compiled=True`` + eager dispatch). ``PURE_DECODE`` and
-    ``PURE_PREFILL`` both keep the baseline comm family (the stock selector
-    with ``enable_fused_mc2 == 0``), so the compiled/ACL-graph decode path
-    never changes its comm object. See ``docs/moeffn-phase-keyed-hybrid.md``
-    for the full envelope and safety argument.
+    ``NON_DECODE_FUSED`` is the single supported experimental value. It makes
+    two independent, phase-keyed decisions on the v1 runner:
+
+    - ``PURE_DECODE`` selects the **baseline** comm family (the stock selector
+      with ``enable_fused_mc2 == 0``) and bypasses the torch.compile/AOT
+      artifact (``skip_compiled=True``), so the FULL_DECODE_ONLY ACL graphs
+      capture and replay raw baseline ops. ``force_eager`` stays ``False``.
+    - ``PURE_PREFILL`` and ``MIXED`` select ``MoECommType.FUSED_MC2`` and
+      force eager dispatch (``force_eager=True`` ->
+      ``CUDAGraphMode.NONE``), so they fall through the outer ACL graph
+      wrapper and run the single fused torch.compile/AOT artifact. When the
+      static SoC capability gate does not hold, startup/first-profile
+      selection **raises a deterministic ``ValueError``** (fail fast): a
+      non-decode wave never falls back to the token-dependent baseline comm
+      family inside the single fused lane, because swapping the comm object
+      per wave is exactly the stale-template failure this policy prevents.
+
+    The two decisions never combine on one phase: decode is raw-baseline-in-
+    ACL-graphs, nondecode is fused-via-torch.compile-outside-ACL-graphs.
+    See ``docs/moeffn-phase-keyed-hybrid.md`` for the full envelope and
+    safety argument.
     """
 
     OFF = 0
-    MIXED_PREFILL_FUSED = 1
+    NON_DECODE_FUSED = 1
 
 
 def parse_moe_phase_hybrid_policy(raw: Any) -> MoEPhaseHybridPolicy:
@@ -51,9 +63,12 @@ def parse_moe_phase_hybrid_policy(raw: Any) -> MoEPhaseHybridPolicy:
 
     Additional-config only: there is deliberately no environment-variable
     fallback. Missing/``None`` selects ``OFF``. The accepted values are
-    exactly ``off`` and ``mixed_prefill_fused``; bool-like aliases
+    exactly ``off`` and ``non_decode_fused``; bool-like aliases
     (``0``/``1``/``true``/``false``/``on``/...) are rejected so the switch
-    cannot be set ambiguously. Any other value raises, failing closed at
+    cannot be set ambiguously. The retired ``mixed_prefill_fused`` spelling of
+    the earlier, over-narrow pilot is deliberately rejected too: silently
+    mapping it onto the corrected semantics would change the graph behavior
+    the pilot actually ran with. Any other value raises, failing closed at
     startup instead of silently keeping stock behavior that the user
     believed they had enabled.
     """
@@ -62,12 +77,13 @@ def parse_moe_phase_hybrid_policy(raw: Any) -> MoEPhaseHybridPolicy:
     value = str(raw).strip().lower()
     if value == "off":
         return MoEPhaseHybridPolicy.OFF
-    if value == "mixed_prefill_fused":
-        return MoEPhaseHybridPolicy.MIXED_PREFILL_FUSED
+    if value == "non_decode_fused":
+        return MoEPhaseHybridPolicy.NON_DECODE_FUSED
     raise ValueError(
         "Invalid additional_config.moe_phase_hybrid_policy value "
-        f"{raw!r}: expected exactly 'off' (default) or 'mixed_prefill_fused'; "
-        "bool-like aliases (0/1/true/false/on) are deliberately rejected"
+        f"{raw!r}: expected exactly 'off' (default) or 'non_decode_fused'; "
+        "bool-like aliases (0/1/true/false/on) and the retired "
+        "'mixed_prefill_fused' spelling are deliberately rejected"
     )
 
 

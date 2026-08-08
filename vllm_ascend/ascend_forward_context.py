@@ -91,43 +91,84 @@ def is_moe_phase_hybrid_active(
     vllm_config: VllmConfig,
     is_draft_model: bool = False,
 ) -> bool:
-    """Whether the current forward runs under the fused mixed-prefill path.
+    """Whether the current forward runs under the fused non-decode path.
 
     True only when the policy is enabled, the forward is the main (non-draft)
-    MoE model, and the phase is exactly ``MIXED``. Only MIXED selects
-    ``FUSED_MC2`` and bypasses the compiled model; ``PURE_PREFILL`` and
-    ``PURE_DECODE`` keep the baseline comm family, so they are never
-    'hybrid active'.
+    MoE model, and the phase is ``PURE_PREFILL`` or ``MIXED``. Both non-decode
+    phases select ``FUSED_MC2`` (under the SoC gate) and run the fused
+    torch.compile artifact outside the ACL graphs; ``PURE_DECODE`` is
+    deliberately excluded because it runs the baseline comm family as raw ops
+    inside the FULL_DECODE_ONLY ACL graphs.
     """
     return (
-        get_moe_phase_hybrid_policy(vllm_config) == MoEPhaseHybridPolicy.MIXED_PREFILL_FUSED
-        and not is_draft_model
-        and forward_phase is MoEForwardPhase.MIXED
-        and is_moe_model(vllm_config)
-    )
-
-
-def should_bypass_compiled_for_moe_phase_hybrid(
-    forward_phase: MoEForwardPhase | None,
-    vllm_config: VllmConfig,
-    is_draft_model: bool = False,
-) -> bool:
-    """Whether the forward must bypass the compiled model under the policy.
-
-    With the policy enabled, BOTH ``PURE_PREFILL`` and ``MIXED`` force
-    ``skip_compiled=True`` and eager dispatch (cudagraph NONE), so decode is
-    the only compiled/ACL-graph path. This is required even for
-    ``PURE_PREFILL`` (which selects the baseline comm family, not fused):
-    on A3 the decode baseline can be MC2 while a large pure-prefill baseline
-    is ALLTOALL, so a pure-prefill wave must never reuse the decode-compiled
-    MC2 artifact. ``PURE_DECODE`` keeps the stock compiled/captured path.
-    """
-    return (
-        get_moe_phase_hybrid_policy(vllm_config) == MoEPhaseHybridPolicy.MIXED_PREFILL_FUSED
+        get_moe_phase_hybrid_policy(vllm_config) == MoEPhaseHybridPolicy.NON_DECODE_FUSED
         and not is_draft_model
         and forward_phase in (MoEForwardPhase.PURE_PREFILL, MoEForwardPhase.MIXED)
         and is_moe_model(vllm_config)
     )
+
+
+def should_skip_compiled_for_moe_phase_hybrid(
+    forward_phase: MoEForwardPhase | None,
+    vllm_config: VllmConfig,
+    is_draft_model: bool = False,
+) -> bool:
+    """Whether the forward must bypass the torch.compile/AOT artifact.
+
+    Under the policy this is true ONLY for ``PURE_DECODE``: decode must run
+    the raw baseline comm ops (never the fused artifact) so the FULL_DECODE_ONLY
+    ACL graphs capture and replay exactly the raw baseline. This flag is
+    deliberately independent from :func:`should_force_eager_for_moe_phase_hybrid`
+    and is never fed into ``force_eager``; ``skip_compiled`` only disables the
+    compiled model call inside the model forward, it does not choose the ACL
+    graph mode.
+    """
+    return (
+        get_moe_phase_hybrid_policy(vllm_config) == MoEPhaseHybridPolicy.NON_DECODE_FUSED
+        and not is_draft_model
+        and forward_phase is MoEForwardPhase.PURE_DECODE
+        and is_moe_model(vllm_config)
+    )
+
+
+def should_force_eager_for_moe_phase_hybrid(
+    forward_phase: MoEForwardPhase | None,
+    vllm_config: VllmConfig,
+    is_draft_model: bool = False,
+) -> bool:
+    """Whether the forward must force eager dispatch (cudagraph NONE).
+
+    Under the policy this is true for ``PURE_PREFILL`` and ``MIXED``: the
+    fused comm path runs outside the ACL graphs, and ``force_eager`` is the
+    belt-and-braces guarantee that a non-decode wave is never dispatched into
+    (or replayed from) a FULL template. Without it, the runner's
+    ``uniform_decode`` heuristic can classify a 1-token prefill as a uniform
+    decode wave when ``speculative_config`` is absent. ``PURE_DECODE`` keeps
+    ``force_eager=False`` so FULL capture/replay of the raw baseline proceeds.
+    """
+    return (
+        get_moe_phase_hybrid_policy(vllm_config) == MoEPhaseHybridPolicy.NON_DECODE_FUSED
+        and not is_draft_model
+        and forward_phase in (MoEForwardPhase.PURE_PREFILL, MoEForwardPhase.MIXED)
+        and is_moe_model(vllm_config)
+    )
+
+
+def get_moe_phase_hybrid_warmup_phase(
+    vllm_config: VllmConfig,
+    is_draft_model: bool = False,
+) -> MoEForwardPhase | None:
+    """Explicit non-decode phase for profile/compile warmups under the policy.
+
+    Returns ``MoEForwardPhase.MIXED`` when the policy is active on the main
+    MoE model, so profile and compile-size warmups deterministically execute
+    the fused non-decode path before decode warmup/capture. Returns ``None``
+    (caller keeps its historical default phase) when the policy is off, the
+    model is not MoE, or the forward is a draft model.
+    """
+    if not is_moe_phase_hybrid_active(MoEForwardPhase.MIXED, vllm_config, is_draft_model):
+        return None
+    return MoEForwardPhase.MIXED
 
 
 def validate_moe_phase_hybrid_policy(vllm_config: VllmConfig) -> None:
@@ -137,15 +178,23 @@ def validate_moe_phase_hybrid_policy(vllm_config: VllmConfig) -> None:
       prefill) for the same step, but the fused MC2 collectives span the EP
       group which includes every DP rank. A per-rank phase-dependent comm
       choice would deadlock or corrupt shapes, so DP > 1 raises at startup.
-    - V2 runner: the upstream V2 runner computes ``skip_compiled`` itself;
-      vllm-ascend cannot force the fused prefill path to bypass the compiled
-      model from the platform hook. Without that bypass the historical
-      stale-layout failure is reproducible, so V2 raises at startup.
-    - Cudagraph envelope: only ``FULL_DECODE_ONLY`` dispatches prefill/mixed
-      waves to NONE structurally, so pure decode is the only graph path.
-      FULL / FULL_AND_PIECEWISE / PIECEWISE can dispatch prefill into a
-      template and are rejected; ``NONE`` (no decode graphs) is rejected
-      because the policy's invariant requires decode graphs to exist.
+    - V2 runner: the upstream V2 runner owns the ``skip_compiled`` /
+      ``force_eager`` decisions itself, so vllm-ascend cannot enforce the
+      phase-keyed matrix (raw baseline decode in ACL graphs, fused non-decode
+      outside them) from the platform hook. V2 raises at startup.
+    - Cudagraph envelope: only ``FULL_DECODE_ONLY`` keeps non-decode waves
+      out of graph templates structurally (backed by ``force_eager`` at the
+      runner), so pure decode is the only graph path. FULL /
+      FULL_AND_PIECEWISE / PIECEWISE can dispatch prefill into a template
+      and are rejected; ``NONE`` (no decode graphs) is rejected because the
+      policy's invariant requires decode graphs to exist.
+    - SoC/EP capability gate: the static fused-MC2 gate (A3 EP<=32, A2
+      fused-A2 conditions) cannot be evaluated here because the EP process
+      group is not initialized at platform startup. It is enforced **fail
+      fast** by :func:`select_moe_comm_method` at the first non-decode
+      forward -- under this policy that is the unconditional fused MIXED
+      profile dummy, before any decode capture or fused compilation -- and
+      never by a baseline fallback.
     """
     if get_moe_phase_hybrid_policy(vllm_config) == MoEPhaseHybridPolicy.OFF:
         return
@@ -154,7 +203,7 @@ def validate_moe_phase_hybrid_policy(vllm_config: VllmConfig) -> None:
     # baseline family and the experiment is not actually enabled.
     if get_ascend_config().enable_fused_mc2 != 1:
         raise ValueError(
-            "additional_config.moe_phase_hybrid_policy=mixed_prefill_fused "
+            "additional_config.moe_phase_hybrid_policy=non_decode_fused "
             "requires additional_config.enable_fused_mc2 == 1: the fused "
             "comm impl and the NZ weight layout are only initialized in that "
             "mode. Without it the policy silently selects the baseline "
@@ -162,7 +211,7 @@ def validate_moe_phase_hybrid_policy(vllm_config: VllmConfig) -> None:
         )
     if vllm_config.parallel_config.data_parallel_size > 1:
         raise ValueError(
-            "additional_config.moe_phase_hybrid_policy=mixed_prefill_fused "
+            "additional_config.moe_phase_hybrid_policy=non_decode_fused "
             "requires data_parallel_size == 1: DP ranks can schedule "
             "different phases for the same step, and FUSED_MC2 collectives "
             "span all DP ranks, so a per-rank phase-dependent comm choice is "
@@ -170,21 +219,22 @@ def validate_moe_phase_hybrid_policy(vllm_config: VllmConfig) -> None:
         )
     if vllm_config.use_v2_model_runner:
         raise ValueError(
-            "additional_config.moe_phase_hybrid_policy=mixed_prefill_fused "
+            "additional_config.moe_phase_hybrid_policy=non_decode_fused "
             "is not supported on the V2 model runner: the upstream runner "
-            "owns skip_compiled, so vllm-ascend cannot force fused prefill "
-            "forwards to bypass the compiled model, which would recreate the "
+            "owns skip_compiled/force_eager, so vllm-ascend cannot enforce "
+            "the phase-keyed matrix (raw baseline decode inside ACL graphs, "
+            "fused non-decode outside them), which would recreate the "
             "stale-layout failure."
         )
     cudagraph_mode = vllm_config.compilation_config.cudagraph_mode
     if cudagraph_mode != CUDAGraphMode.FULL_DECODE_ONLY:
         raise ValueError(
-            "additional_config.moe_phase_hybrid_policy=mixed_prefill_fused "
+            "additional_config.moe_phase_hybrid_policy=non_decode_fused "
             f"requires cudagraph_mode == FULL_DECODE_ONLY, got {cudagraph_mode}. "
             "FULL / FULL_AND_PIECEWISE / PIECEWISE can dispatch prefill or "
             "mixed waves into a graph template, which would either replay a "
             "stock template under a fused intent or require unsafe runtime "
-            "capture; skip_compiled alone does not protect that envelope."
+            "capture; force_eager alone does not protect that envelope."
         )
 
 
@@ -238,13 +288,14 @@ def set_ascend_forward_context(
     can be attention metadata, etc.
     We add some additional param into forward_context.
     """
-    # Phase-keyed hybrid MoE policy (experimental, default OFF). Only MIXED
-    # selects the fused comm path; PURE_PREFILL keeps the baseline comm
-    # family. Both bypass the compiled model (skip_compiled=True) so one
-    # torch.compile/ACL template never embeds two different comm objects and
-    # decode is the only compiled path. PURE_DECODE keeps the stock
-    # compiled/captured decode path untouched.
-    if should_bypass_compiled_for_moe_phase_hybrid(forward_phase, vllm_config, is_draft_model):
+    # Phase-keyed hybrid MoE policy (experimental, default OFF). Under the
+    # policy, ONLY PURE_DECODE bypasses the torch.compile/AOT artifact
+    # (skip_compiled=True): decode runs the raw baseline comm ops so the
+    # FULL_DECODE_ONLY ACL graphs capture/replay exactly those raw ops.
+    # PURE_PREFILL and MIXED keep skip_compiled=False and run the one fused
+    # torch.compile artifact outside the ACL graphs (force_eager is decided
+    # by the runner, never derived from skip_compiled).
+    if should_skip_compiled_for_moe_phase_hybrid(forward_phase, vllm_config, is_draft_model):
         validate_moe_phase_hybrid_policy(vllm_config)
         skip_compiled = True
     forward_context_kwargs = {
@@ -407,8 +458,8 @@ def get_mc2_mask():
     return _reserved_mc2_mask
 
 
-def _moe_phase_hybrid_prefill_fused_available(vllm_config: VllmConfig) -> bool:
-    """SoC capability gate for the fused prefill path of the hybrid policy.
+def _moe_phase_hybrid_non_decode_fused_available(vllm_config: VllmConfig) -> bool:
+    """SoC capability gate for the fused non-decode path of the hybrid policy.
 
     Reuses exactly the same conditions the stock selector applies for the
     FUSED_MC2 / dispatch_ffn_combine BF16 path. Deliberately token-count
@@ -444,6 +495,45 @@ def _moe_phase_hybrid_prefill_fused_available(vllm_config: VllmConfig) -> bool:
     return False
 
 
+def _moe_phase_hybrid_non_decode_fused_error(vllm_config: VllmConfig, phase: MoEForwardPhase) -> ValueError:
+    """Build the deterministic fail-fast error for an unsupported gate.
+
+    Under ``NON_DECODE_FUSED`` a non-decode phase must never select the
+    baseline comm family: the baseline family is token-threshold dependent,
+    so a baseline wave inside the single fused torch.compile lane could swap
+    the comm object per wave and recreate the stale-template failure. The
+    message names the gate requirement so the operator can fix the
+    configuration (or turn the policy off) instead of discovering a
+    nondeterministic runtime mismatch.
+    """
+    # The gate helper just ran, so the EP group is resolved; these reads are
+    # only for a precise diagnostic message.
+    ep_world_size = get_ep_group().world_size
+    num_experts = vllm_config.model_config.get_num_experts()
+    ep_world_size_from_config = (
+        vllm_config.parallel_config.world_size_across_dp // vllm_config.parallel_config.pipeline_parallel_size
+    )
+    num_experts_per_device = num_experts // max(ep_world_size_from_config, 1)
+    quant_type = getattr(
+        vllm_config.model_config.hf_text_config,
+        "moe_quantize",
+        getattr(vllm_config.model_config.hf_text_config, "quantize", None),
+    )
+    return ValueError(
+        "additional_config.moe_phase_hybrid_policy=non_decode_fused: "
+        f"{phase.name} requires the static fused-MC2 capability gate, which "
+        "is unavailable on this configuration "
+        f"(soc={get_ascend_device_type()}, enable_fused_mc2="
+        f"{get_ascend_config().enable_fused_mc2}, ep_world_size={ep_world_size}, "
+        f"quant={quant_type!r}, local_experts={num_experts_per_device}). "
+        "A non-decode wave must NEVER fall back to the token-dependent "
+        "baseline comm family inside the single fused torch.compile lane; "
+        "fix the gate (A3: enable_fused_mc2==1 and EP<=32; A2: "
+        "enable_fused_mc2==1, EP<=8, quant in {None, w8a8_dynamic}, and "
+        ">=3 local experts) or set moe_phase_hybrid_policy=off."
+    )
+
+
 def select_moe_comm_method(
     num_tokens: int,
     vllm_config: VllmConfig,
@@ -453,42 +543,59 @@ def select_moe_comm_method(
 ) -> MoECommType | None:
     """Select the MoE communication method, optionally phase-keyed.
 
-    With the hybrid policy OFF (default), or with ``phase=None`` (legacy
-    callers such as the spec-decode proposers), this returns exactly the
-    stock selector result.
+    With the hybrid policy OFF (default), with ``phase=None`` (legacy
+    callers such as the spec-decode proposers), or for non-MoE / draft
+    models, this returns exactly the stock selector result.
 
-    With ``MoEPhaseHybridPolicy.MIXED_PREFILL_FUSED``:
+    With ``MoEPhaseHybridPolicy.NON_DECODE_FUSED``:
 
-    - ``MIXED`` selects ``MoECommType.FUSED_MC2`` when the SoC capability
-      gate holds, otherwise it fails closed to the baseline family.
-    - ``PURE_DECODE`` and ``PURE_PREFILL`` select the baseline family -- the
-      stock selector with ``enable_fused_mc2 == 0`` -- so the compiled/ACL
-      decode path keeps the exact comm object it captured with (never the
-      fused path the stock selector would pick under ``enable_fused_mc2=1``),
-      and pure prefill introduces no second comm object into any template.
+    - ``PURE_PREFILL`` and ``MIXED`` select ``MoECommType.FUSED_MC2``; when
+      the static SoC capability gate does not hold, selection **raises a
+      deterministic ``ValueError``** (fail fast) instead of falling back to
+      the token-dependent baseline family -- a baseline non-decode wave
+      inside the single fused torch.compile lane is exactly the stale-template
+      failure this policy exists to prevent.
+    - ``PURE_DECODE`` selects the baseline family -- the stock selector with
+      ``enable_fused_mc2 == 0`` -- so the raw decode path inside the
+      FULL_DECODE_ONLY ACL graphs keeps exactly the comm object it captured
+      with (never the fused path the stock selector would pick under
+      ``enable_fused_mc2=1``).
     """
-    if get_moe_phase_hybrid_policy(vllm_config) == MoEPhaseHybridPolicy.OFF or phase is None or is_draft_model:
+    if (
+        get_moe_phase_hybrid_policy(vllm_config) == MoEPhaseHybridPolicy.OFF
+        or phase is None
+        or is_draft_model
+        or not is_moe_model(vllm_config)
+    ):
+        # Non-MoE models return None (no comm family at all), so they never
+        # enter the fail-fast non-decode branch.
         return _select_moe_comm_method_stock(num_tokens, vllm_config, is_draft_model)
-    if phase == MoEForwardPhase.MIXED and _moe_phase_hybrid_prefill_fused_available(vllm_config):
-        logger.debug(
-            "MoE phase-keyed hybrid: phase=%s selects %s",
-            phase,
-            MoECommType.FUSED_MC2,
-        )
-        return MoECommType.FUSED_MC2
+    if phase in (MoEForwardPhase.PURE_PREFILL, MoEForwardPhase.MIXED):
+        if _moe_phase_hybrid_non_decode_fused_available(vllm_config):
+            logger.debug(
+                "MoE phase-keyed hybrid: phase=%s selects %s",
+                phase,
+                MoECommType.FUSED_MC2,
+            )
+            return MoECommType.FUSED_MC2
+        # Fail fast, never fail closed: a baseline non-decode wave would swap
+        # the comm object inside the single fused torch.compile lane (the
+        # baseline family is token-threshold dependent), which is exactly the
+        # stale-template failure this policy exists to prevent. The first
+        # non-decode forward -- under the policy that is the unconditional
+        # fused MIXED profile dummy -- raises before any decode capture or
+        # fused compilation, so the error is deterministic and precedes
+        # compilation/first profile.
+        raise _moe_phase_hybrid_non_decode_fused_error(vllm_config, phase)
+    # PURE_DECODE: the raw baseline family, exactly what the FULL_DECODE_ONLY
+    # ACL graphs capture and replay (never the fused path the stock selector
+    # would pick under enable_fused_mc2=1).
     baseline_type = _select_moe_comm_method_baseline(num_tokens, vllm_config, is_draft_model)
-    if phase == MoEForwardPhase.MIXED:
-        logger.debug(
-            "MoE phase-keyed hybrid: fused mixed-prefill unavailable (phase=%s), failing closed to baseline %s",
-            phase,
-            baseline_type,
-        )
-    else:
-        logger.debug(
-            "MoE phase-keyed hybrid: phase=%s selects baseline %s",
-            phase,
-            baseline_type,
-        )
+    logger.debug(
+        "MoE phase-keyed hybrid: phase=%s selects baseline %s",
+        phase,
+        baseline_type,
+    )
     return baseline_type
 
 
@@ -499,7 +606,8 @@ def _select_moe_comm_method_baseline(
 
     This is the explicit, auditable version of "what the stock selector
     would choose if fused MC2 were disabled". The phase-keyed hybrid policy
-    uses it for every non-``MIXED`` phase, so under the policy the decode
+    uses it for ``PURE_DECODE`` only (a non-decode phase with an unavailable
+    fused gate raises fail-fast instead), so under the policy the decode
     comm object is the baseline family (ALLGATHER on the A2/TP2 experiment,
     MC2 or ALLTOALL on A3), never the fused path the stock selector would
     pick with ``enable_fused_mc2=1``. It is written out explicitly rather

@@ -1,9 +1,11 @@
 # Phase-keyed hybrid MoE comm policy (experimental, default OFF)
 
 Status: **experimental mechanism, default disabled**. This document records the
-design, the historical failure it must not reproduce, the safety invariants and
-their audit, the exact execution envelope, the selector truth table, and the
-unit-test contract. It is a mechanism/design note, not a performance promise.
+corrected design, the historical failure it must not reproduce, the retired
+over-narrow pilot that is retained only as a negative prototype, the safety
+invariants and their audit, the exact execution envelope, the selector truth
+table, the 2x2 dispatch matrix, and the unit-test contract. It is a
+mechanism/design note, not a performance promise.
 
 ## Motivation
 
@@ -20,9 +22,10 @@ selector that swapped the Python comm object (`FusedMC2CommImpl` <-> `AllGatherC
 inside one `torch.compile` model graph failed at startup with
 `'AllGatherCommImpl' object has no attribute 'expert_token_nums'` — the compiled
 template kept the first object's layout. That patch was withdrawn. A safe hybrid
-needs either per-path compiled graphs or a stable data-driven interface; this
-prototype provides the former by keeping exactly one comm object family inside
-every compiled/ACL template.
+needs exactly one comm object family inside every compiled/ACL template. The
+corrected policy achieves this by giving **decode** and **non-decode** separate
+execution lanes (see "Two independent decisions" below), so no template ever
+changes comm family at runtime.
 
 ## Configuration
 
@@ -31,7 +34,7 @@ variable**: repo convention funnels new switches through
 `vllm_ascend/ascend_config.py`, and this switch is a config-user choice.
 
 ```bash
---additional-config '{"enable_fused_mc2":1,"moe_phase_hybrid_policy":"mixed_prefill_fused"}'
+--additional-config '{"enable_fused_mc2":1,"moe_phase_hybrid_policy":"non_decode_fused"}'
 ```
 
 `enable_fused_mc2: 1` is REQUIRED, not optional: the fused comm impl and the
@@ -44,13 +47,17 @@ baseline family.
 
 | value | meaning |
 |---|---|
-| `off` (default when missing) | stock selector, byte-for-byte; no phase keying, no skip_compiled |
-| `mixed_prefill_fused` | only the `MIXED` forward phase may select `MoECommType.FUSED_MC2` (the existing `dispatch_ffn_combine` BF16 path); `PURE_PREFILL` and `MIXED` both bypass the compiled model |
+| `off` (default when missing) | stock selector, byte-for-byte; no phase keying, no dispatch changes |
+| `non_decode_fused` | `PURE_DECODE` runs the baseline comm family as raw ops inside the FULL_DECODE_ONLY ACL graphs (`skip_compiled=True`, `force_eager=False`); `PURE_PREFILL` and `MIXED` run `FUSED_MC2` through the single fused torch.compile/AOT artifact outside the ACL graphs (`skip_compiled=False`, `force_eager=True`). If the static fused-MC2 capability gate is unavailable, selection **raises a deterministic `ValueError`** (fail fast) instead of ever falling back to the baseline family |
 
-The accepted values are exactly `off` and `mixed_prefill_fused`. Bool-like
+The accepted values are exactly `off` and `non_decode_fused`. Bool-like
 aliases (`0`/`1`/`true`/`false`/`on`/`none`/...) are deliberately rejected so
-the switch cannot be set ambiguously; any unrecognized value raises
-`ValueError` at `AscendConfig` construction and fails closed at startup.
+the switch cannot be set ambiguously. The retired `mixed_prefill_fused`
+spelling of the earlier pilot is **also rejected**: it encoded the wrong
+over-narrow semantics, and silently mapping it onto the corrected behavior
+would change the graph execution that the pilot actually measured. Any
+unrecognized value raises `ValueError` at `AscendConfig` construction and
+fails closed at startup.
 
 ## Forward phase classification
 
@@ -64,12 +71,37 @@ distinguishes, from the v1 runner's `attn_state`/`with_prefill` CPU state:
 - `MIXED` — at least one request is prefilling alongside requests that
   already have computed tokens (`ChunkedPrefill` / `PrefillCacheHit`).
 
-**Only `MIXED` is in the fused experiment.** `PURE_PREFILL` is deliberately
-NOT part of the fused path: the existing evidence supports the
-mixed/interleaved unit only, and extending pure prefill to fused requires
-separate measurement. Under the policy, `PURE_PREFILL` keeps the baseline
-comm family but still bypasses the compiled model (see the safety argument),
-so it never reuses a decode-compiled artifact.
+`PURE_PREFILL` and `MIXED` are the **fused non-decode** lanes; `PURE_DECODE`
+is the **raw baseline** lane. There is no token-count-dependent selection
+anywhere: per-wave token thresholds are exactly what historically swapped the
+comm object inside one compiled template.
+
+## Two independent decisions (the 2x2 matrix)
+
+The corrected policy keeps two independent per-phase controls and never
+derives one from the other:
+
+| phase | `skip_compiled` (torch.compile/AOT) | `force_eager` (ACL dispatch) | result |
+|---|---|---|---|
+| `PURE_DECODE` | `True` | `False` | raw baseline comm ops captured/replayed by FULL_DECODE_ONLY ACL graphs |
+| `PURE_PREFILL` | `False` | `True` | fused `FUSED_MC2` via the one torch.compile/AOT artifact, ACL mode NONE |
+| `MIXED` | `False` | `True` | fused `FUSED_MC2` via the one torch.compile/AOT artifact, ACL mode NONE |
+| policy OFF / `phase=None` / draft | stock | stock | byte-for-byte stock behavior |
+
+- `skip_compiled=True` (only `PURE_DECODE` under the policy) bypasses the
+  compiled model call (`ForwardContext.skip_compiled`, honored by upstream
+  `vllm/compilation/decorators.py`), so the decode ACL graphs embed the raw
+  baseline ops — never the fused artifact, and never whatever comm the stock
+  selector would have baked under `enable_fused_mc2=1`.
+- `force_eager=True` (only `PURE_PREFILL`/`MIXED` under the policy) forces
+  `CUDAGraphMode.NONE` in `_determine_batch_execution_and_padding`, so the
+  outer `ACLGraphWrapper` falls through and the wave runs the fused compiled
+  artifact. This is the belt-and-braces guarantee that a non-decode wave is
+  never dispatched into (or replayed from) a FULL template, even when the
+  runner's `uniform_decode` heuristic misclassifies a 1-token prefill as a
+  uniform decode wave because `speculative_config` is absent.
+- The two controls never combine on one phase; in particular
+  `skip_compiled` is **never fed into** `force_eager`.
 
 ## Execution envelope (fail closed)
 
@@ -79,96 +111,107 @@ runs at startup (platform `check_and_update_config`, after all platform mode
 fallbacks) and raises otherwise:
 
 - `FULL` / `FULL_AND_PIECEWISE` / `PIECEWISE`: prefill or mixed waves can be
-  dispatched into a graph template there. That would either replay a baseline
-  template under a fused intent or trigger runtime capture after capture is
-  disabled. `skip_compiled` alone does not protect that envelope, so these
-  modes are rejected.
+  dispatched into a graph template there. That would either replay a raw
+  baseline template under a fused intent or trigger runtime capture after
+  capture is disabled. `force_eager` alone does not protect that envelope,
+  so these modes are rejected.
 - `NONE` (no graphs): rejected — the invariant "decode is the only
   compiled/ACL-graph path" requires decode graphs to exist.
 - `enable_fused_mc2 != 1`: rejected — the fused comm impl and the NZ weight
   layout are only initialized with `enable_fused_mc2 == 1`; without it the
   policy would silently stay on the baseline family and the experiment would
   not actually be enabled.
-- V2 runner: rejected — upstream V2 owns `skip_compiled`; vllm-ascend cannot
-  force fused mixed-prefill forwards to bypass the compiled model from the
-  platform hook.
+- SoC/EP capability gate: the static fused-MC2 gate (A3 `enable_fused_mc2==1`
+  and EP<=32; A2 fused-A2 conditions) cannot be checked at platform startup
+  because the EP process group is not initialized yet. It is enforced **fail
+  fast** by `select_moe_comm_method` at the first non-decode forward — under
+  this policy that is the unconditional fused `MIXED` profile dummy, which
+  runs before `super().profile_run()` and before any decode warmup/capture —
+  so an unsupported SoC/EP configuration raises a clear deterministic error
+  before any compiled artifact exists. Non-decode never falls back to the
+  token-dependent baseline family.
+- V2 runner: rejected — upstream V2 owns `skip_compiled`/`force_eager` itself;
+  vllm-ascend cannot enforce the phase-keyed matrix from the platform hook.
 - DP > 1: rejected — DP ranks can schedule different phases for the same step,
-  while FUSED_MC2 collectives span the EP group (which includes all DP ranks).
-  A per-rank phase-dependent comm choice is not DP-consistent, so the policy
-  fails closed instead of deadlocking.
+  while the fused MC2 collectives span all DP ranks; a per-rank phase-
+  dependent comm choice is not DP-consistent.
 
-The same validation is invoked defensively inside
-`set_ascend_forward_context` on every hybrid-active forward, so a runner that
-somehow bypasses the startup check fails on its first forward rather than at
-request time.
+## Selector truth table
 
-## Selector semantics: baseline family, not stock
+`select_moe_comm_method(num_tokens, vllm_config, is_draft_model=False, *, phase=None)`:
 
-The blocker that made the first revision ineffective: under
-`enable_fused_mc2=1` (A2 or A3), the **stock** selector already returns
-`FUSED_MC2` for decode — so "decode keeps stock" would leave decode fused and
-the hybrid would be a no-op with the stale-layout risk still present.
+| policy | phase | EP / SoC gate | result |
+|---|---|---|---|
+| OFF (default) | any / None | any | stock (unchanged, incl. `None` for non-MoE) |
+| ON | `None` (legacy callers, e.g. spec-decode proposers) | any | stock |
+| ON | draft model | any | stock |
+| ON | `PURE_PREFILL` / `MIXED` | A3: `enable_fused_mc2==1` and EP<=32; A2: fused-A2 gate | `FUSED_MC2` |
+| ON | `PURE_PREFILL` / `MIXED` | gate fails | **raise `ValueError` (fail fast)** — never a baseline fallback |
+| ON | `PURE_DECODE` | any | baseline (A2/TP2: `ALLGATHER`) |
+| ON | any | non-MoE | `None` |
 
-The corrected rule: when the policy is enabled,
-
-- `MIXED` → `FUSED_MC2` when the SoC capability gate holds, else fail closed
-  to the **baseline** family;
-- `PURE_DECODE` and `PURE_PREFILL` → the **baseline** family, defined as what
-  the stock selector would choose with `enable_fused_mc2 == 0` (explicit
-  `_select_moe_comm_method_baseline`, written out rather than simulated by
-  mutating global config). For the A2/TP2 experiment that is `ALLGATHER`.
-
-So under the policy the decode comm object is **exactly the object the decode
-ACL graph captured with** — the same family as an `enable_fused_mc2=0` run —
-and only MIXED (which never enters a graph) runs fused.
+Baseline family by SoC (identical to stock with `enable_fused_mc2=0`): A2 →
+`MC2` when `num_experts_per_device <= 24`, EP>=16 and tokens fit MC2 capacity,
+else `ALLGATHER`; A3 → `MC2` within MC2 capacity else `ALLTOALL`; 310P →
+`ALLGATHER`; A5 → stock (no fused branch there).
 
 ## Why this cannot reproduce the historical stale-layout failure
 
-Two independent layers enforce "one compiled/captured template = one comm
-object":
+1. **One template = one comm family.** The decode ACL templates are captured
+   from the raw baseline forward (`skip_compiled=True` + baseline selector),
+   and that is exactly what runtime decode replays. The fused non-decode path
+   runs through the one torch.compile/AOT artifact outside the ACL graphs; the
+   artifact is only ever traced with the non-decode context, which always
+   selects the same family for a given process (the SoC gate result is
+   static). No phase and no token threshold can swap a comm object inside any
+   template.
+2. **The compiled artifact never serves decode.** Decode bypasses
+   `torch.compile` entirely, so the fused artifact and the raw decode graphs
+   are disjoint execution lanes. An unmatched/runtime decode wave that falls
+   through the ACL wrapper (mode NONE) still runs the raw baseline forward
+   because `skip_compiled` remains `True` for decode.
 
-1. **Comm object stability (baseline selector)**: with the policy enabled,
-   decode and pure prefill always select the `enable_fused_mc2=0` baseline
-   family — never fused. The compiled/ACL decode template therefore embeds the
-   same comm object family for the whole process; no `num_tokens >= N`
-   threshold (the historical bug) and no phase can swap the object inside a
-   template. There is deliberately **no token-count-dependent selection
-   anywhere** in the hybrid path.
-2. **Compiled path + dispatch (`skip_compiled=True` + cudagraph NONE)**:
-   under the policy, BOTH `PURE_PREFILL` and `MIXED` (a) bypass the compiled
-   model (`ForwardContext.skip_compiled`, honored by upstream
-   `vllm/compilation/decorators.py`) and (b) force eager dispatch
-   (`force_eager` in `_determine_batch_execution_and_padding` →
-   `CUDAGraphMode.NONE`). This is required even for `PURE_PREFILL`, which
-   keeps the baseline comm family: on A3 the decode baseline can be MC2 while
-   a large pure-prefill baseline is ALLTOALL, so a pure-prefill wave must
-   never reuse the decode-compiled MC2 artifact. `force_eager` is the
-   belt-and-braces guarantee that neither a pure-prefill nor a mixed wave
-   ever enters FULL/PIECEWISE capture or replay; decode is the only compiled
-   path.
+**No ACL cache-key change is needed.** `ACLGraphWrapper`/`compute_acl_graph_cache_key`
+are untouched. Additionally the policy is **deliberately token-count
+independent**; no `num_tokens >= N` logic exists in the hybrid selector.
 
-**No ACL cache-key change is needed.** The safety invariant is "prefill never
-enters a graph"; decode is the only compiled/ACL-graph path and its comm family
-never changes. `ACLGraphWrapper`/`compute_acl_graph_cache_key` are untouched.
+## Capture / dummy-run / profile ordering audit
 
-Additionally the policy is **deliberately token-count independent**: per-wave
-token thresholds are exactly what historically swapped the Python comm object
-inside one compiled template. No `num_tokens >= N` logic exists in the hybrid
-selector.
+The requirement is that the fused non-decode compile and its workspace are
+deterministically established **before** any decode warmup/capture, and that
+memory profiling includes both the FUSED workspace and the raw baseline
+workspace.
 
-## Capture / dummy-run ordering audit
-
-- Capture warmup (`_warmup_and_capture` -> `_dummy_run`) only runs decode-style
-  dummy runs (`with_prefill=False` -> `PURE_DECODE`), so every captured graph
-  is a baseline decode template, exactly matching runtime decode under the
-  policy.
+- `profile_run` (v1 runner): when the policy is active the fused non-decode
+  dummy is **unconditional and first**: it runs even when
+  `max_num_tokens <= mc2_tokens_capacity` (the historical MC2-capacity
+  condition could skip it), with size `min(self.max_num_tokens,
+  mc2_tokens_capacity)` (valid for `_dummy_run`'s `num_tokens <=
+  max_num_batched_tokens` assertion), `with_prefill=True`,
+  `moe_forward_phase=MIXED`, `is_profile=True` (ACL NONE). It compiles the
+  fused artifact and allocates its workspace before `super().profile_run()`
+  and before any decode warmup/capture; if the static fused gate is
+  unavailable it is also the deterministic fail-fast point. In the
+  `--kv-cache-memory` fast path the same `profile_run` still runs, so the
+  fused compile happens there too. Policy OFF keeps the historical
+  conditional MC2-capacity dummy byte-for-byte (with its historical
+  `PURE_PREFILL` phase).
+- Capture warmup (`_warmup_and_capture` -> `_dummy_run`, and `capture_model`)
+  only runs decode-style dummy runs (`with_prefill=False` -> `PURE_DECODE`),
+  so every captured graph is a raw baseline decode template, exactly matching
+  runtime decode under the policy. The decode warmup allocates the raw
+  baseline workspace inside the memory-profiling window, so the profile
+  records both workspaces.
 - `_dummy_run` defaults to the same host phase classification
-  (`PURE_PREFILL` if `with_prefill` else `PURE_DECODE`) but accepts an explicit
-  profile-only phase override; graph capture never uses that override.
-- Under the policy, `profile_run` uses the existing MC2-capacity dummy with an
-  explicit `MIXED` override. It stays eager/`skip_compiled`, warms
-  `dispatch_ffn_combine`, and includes its workspace in memory profiling,
-  rather than making the first real MIXED request pay first-use cost.
+  (`PURE_PREFILL` if `with_prefill` else `PURE_DECODE`), accepts an explicit
+  phase override, and applies the same phase-keyed `force_eager` as the
+  runtime forward, so a non-decode dummy can never capture a fused template
+  into the decode graph pool.
+- `compile_or_warm_up_model` (worker): the generic compile-size warmups pass
+  the explicit non-decode phase under the policy. Otherwise they would
+  default to decode, which under the policy bypasses the compiled model and
+  would never compile the fused artifact at those sizes before decode
+  capture. Policy off keeps the historical `_dummy_run(size)` behavior.
 
 ## Weight-layout compatibility audit
 
@@ -184,8 +227,8 @@ numerically compatible.
 
 **Disclosure:** the hybrid process therefore forces NZ, whereas historical
 stock BF16 decode ran on the default ND layout. A dedicated 2x910B2
-stock-`ALLGATHER` discriminator has now measured that distinction with ACL
-graph enabled, 8 warmups and 30 bracketed samples per arm. Both layouts were
+stock-`ALLGATHER` discriminator has measured that distinction with ACL graph
+enabled, 8 warmups and 30 bracketed samples per arm. Both layouts were
 finite and bitwise identical (`max_abs_diff=0.0`) in every cell, but NZ was
 materially faster than ND:
 
@@ -210,92 +253,34 @@ The receipt's inherited `npu_devices_env="6,7"` is stale container metadata;
 the before/after host snapshots record the actually mounted physical devices
 4 and 5.
 
-## Selector truth table
+## Retired `mixed_prefill_fused` pilot (negative prototype)
 
-`select_moe_comm_method(num_tokens, vllm_config, is_draft_model=False, *, phase=None)`:
+The earlier experimental value `mixed_prefill_fused` and its committed
+prototype are **retired and rejected by the corrected design**. What the pilot
+actually tested was a different, over-narrow policy:
 
-| policy | phase | EP / SoC gate | result |
-|---|---|---|---|
-| OFF (default) | any / None | any | stock (unchanged, incl. `None` for non-MoE) |
-| ON | `None` (legacy callers, e.g. spec-decode proposers) | any | stock |
-| ON | draft model | any | stock |
-| ON | `MIXED` | A3: `enable_fused_mc2==1` and EP<=32; A2: fused-A2 gate | `FUSED_MC2` |
-| ON | `MIXED` | gate fails | baseline (`enable_fused_mc2=0` family), fail closed |
-| ON | `PURE_DECODE` | any | baseline (A2/TP2: `ALLGATHER`) |
-| ON | `PURE_PREFILL` | any | baseline comm (A2/TP2: `ALLGATHER`) **and** bypass compiled (skip_compiled + eager NONE) |
-| ON | any | non-MoE | `None` |
+- only `MIXED` selected `FUSED_MC2`; `PURE_PREFILL` kept the baseline comm
+  family; and
+- `PURE_PREFILL`/`MIXED` **bypassed the compiled model entirely**
+  (`skip_compiled=True` + eager dispatch), so the non-decode lanes ran raw
+  eager with no torch.compile artifact.
 
-Baseline family by SoC (identical to stock with `enable_fused_mc2=0`): A2 →
-`MC2` when `num_experts_per_device <= 24`, EP>=16 and tokens fit MC2 capacity,
-else `ALLGATHER`; A3 → `MC2` within MC2 capacity else `ALLTOALL`; 310P →
-`ALLGATHER`; A5 → unchanged from stock (A5 has no fused branch).
+The corrected `non_decode_fused` policy changes both decisions: non-decode
+now selects `FUSED_MC2` for `PURE_PREFILL` **and** `MIXED`, and keeps the
+torch.compile/AOT artifact (the fused path runs *compiled*, just outside the
+ACL graphs); decode is the only lane that goes raw, and it goes raw inside the
+ACL graphs where its baseline comm family is captured and replayed exactly.
+Because the compiled/eager boundary is the opposite of what the pilot
+measured, **the pilot's negative result does not reject the corrected design.**
 
-## Files touched
+The pilot evidence is retained here as a negative prototype of the naive
+boundary cost and of the old envelope:
 
-- `vllm_ascend/ascend_config.py` — `MoEPhaseHybridPolicy` enum +
-  `parse_moe_phase_hybrid_policy` (additional-config only, default `off`),
-  `AscendConfig.moe_phase_hybrid_policy`.
-- `vllm_ascend/ascend_forward_context.py` — host phase classification,
-  hybrid-active predicate (MIXED only), startup validation, phase-aware
-  selector with explicit baseline selector (`_select_moe_comm_method_baseline`;
-  stock logic kept intact as `_select_moe_comm_method_stock`),
-  `should_bypass_compiled_for_moe_phase_hybrid` (PURE_PREFILL + MIXED bypass
-  the compiled model), `skip_compiled` merge.
-- `vllm_ascend/worker/model_runner_v1.py` — host phase computation, forced
-  eager dispatch for PURE_PREFILL + MIXED under the policy, phase threading
-  into `set_ascend_forward_context` (runtime + dummy runs).
-- `vllm_ascend/platform.py` — startup fail-closed validation after mode
-  resolution; defensive V2 hook validation.
-- `tests/ut/test_ascend_forward_context.py`, `tests/ut/test_ascend_config.py`
-  — unit tests (CPU, no NPU).
-- `docs/moeffn-phase-keyed-hybrid.md` — this note.
-
-## Tests
-
-Coverage includes the selector truth table (A2/TP2 decode+pure-prefill →
-baseline `ALLGATHER`, MIXED → `FUSED_MC2`; A3 capacity/fail-closed cases;
-A5/310P; draft/non-MoE/`phase=None`), default compatibility (policy OFF
-identical to stock for every phase), strict config parsing (default OFF,
-`mixed_prefill_fused` accepted, bool-like aliases raise), 3-way phase
-classification, fail-closed validation (DP / V2 / cudagraph mode /
-`enable_fused_mc2 != 1`), the hybrid-active predicate (MIXED only), the
-bypass-compiled predicate (PURE_PREFILL + MIXED), and `skip_compiled`
-propagation.
-
-## Real-model mechanism gate
-
-The prototype passed a bounded A2/TP2 real-model gate on two Ascend 910B2
-devices with Qwen3-30B-A3B BF16, EP2/DP1, `FULL_DECODE_ONLY`, and capture sizes
-2, 4, 8, 16, and 32:
-
-- startup, memory profiling, and 14 ACL graph captures completed without
-  stale-comm errors, OOM, 507015, or traceback;
-- the server log independently records 208
-  `PURE_DECODE -> baseline ALLGATHER` selections, 8
-  `PURE_PREFILL -> baseline` selections, and 18
-  `MIXED -> FUSED_MC2` selections;
-- an 8-request random serving gate at 462 input / 16 output tokens and QPS 4
-  completed 8/8 with exact requested lengths and no request errors; and
-- a deterministic completion after MIXED/FUSED traffic succeeded, showing
-  that the captured decode graph remained reusable after the eager fused
-  phase.
-
-This establishes mechanism, numerical-serving correctness, and graph-lifetime
-safety for the declared envelope. It is not a performance comparison. The
-local raw receipt is
-`.lumi-workbench/artifacts/moe-phase-hybrid-realmodel-20260808/` and records
-the exact commands, hashes, phase logs, client JSON, and before/after device
-state.
-
-## Same-NZ performance pilot
-
-A bounded control-vs-hybrid pilot compared the committed prototype against the
-original stock selector while holding `enable_fused_mc2=1` in both arms. Both
-arms therefore used the same NZ weights; only
-`moe_phase_hybrid_policy=off|mixed_prefill_fused` changed. Each arm used one
-fresh server followed by three paired seeds, with 24 measured requests plus 4
-warmups per seed at 462 input / 16 output tokens and QPS 4. All six measured
-trials completed 24/24 with no request errors.
+The bounded control-vs-hybrid pilot compared the old prototype against the
+original stock selector while holding `enable_fused_mc2=1` in both arms. Each
+arm used one fresh server followed by three paired seeds, with 24 measured
+requests plus 4 warmups per seed at 462 input / 16 output tokens and QPS 4.
+All six measured trials completed 24/24 with no request errors.
 
 | metric (median over 3 seeds) | stock selector | mixed-only hybrid | delta |
 |---|---:|---:|---:|
@@ -306,42 +291,77 @@ trials completed 24/24 with no request errors.
 | mean TPOT | 34.6 ms | 50.3 ms | +45.6% |
 | median ITL | 19.5 ms | 20.9 ms | +7.3% |
 
-All three paired seeds show the same direction. The hybrid log records 704
-`PURE_DECODE -> ALLGATHER`, 26 `PURE_PREFILL -> ALLGATHER`, and 122
-`MIXED -> FUSED_MC2` debug selections; the stock arm selected FUSED_MC2 under
-its existing policy. These debug counts are selector invocations across both
-ranks, not a direct time decomposition.
-
-**Go/no-go:** do not enable this policy by default for the tested traffic. It
-proves that the requested phase split is mechanically possible, but it does
-not preserve latency at this workload. The pilot does not isolate a single
-cause: the hybrid changes both the decode communication family and the
-compiled/eager boundary for PURE_PREFILL/MIXED. In particular, attributing the
-regression to the fused MIXED kernel alone would overstate the evidence. A
-future attempt would need phase-aware compiled artifacts (or another safe way
-to retain compilation) and a workload deliberately rich in naturally
-co-scheduled MIXED waves before more campaign investment is justified. Raw
-local receipts are under
+The old hybrid log records 704 `PURE_DECODE -> ALLGATHER`, 26
+`PURE_PREFILL -> ALLGATHER`, and 122 `MIXED -> FUSED_MC2` debug selections;
+the stock arm selected FUSED_MC2 under its existing policy. These debug
+counts are selector invocations across both ranks, not a direct time
+decomposition. The pilot's regression was never attributed to the fused
+MIXED kernel alone: it changed both the decode communication family and the
+compiled/eager boundary. Raw local receipts are under
 `.lumi-workbench/artifacts/moe-phase-hybrid-pilot-20260808/`.
+
+## Raw-decode graph risk and required fresh test
+
+The corrected design moves decode **out of the compiled artifact and into raw
+ops inside FULL_DECODE_ONLY ACL graphs**. That carries risks the retired pilot
+did not exercise and which the 462/16 pilot cannot validate:
+
+- **Raw decode graph behavior**: uncompiled decode changes which kernels and
+  workspace allocations live inside the captured graphs (raw baseline comm
+  ops instead of the compiled decode artifact). Graph capture/replay,
+  workspace sizing, and graph memory must be revalidated on real hardware.
+- **Mixed traffic shape**: the pilot's 462 input / 16 output traffic never
+  measured the corrected phase split (decode raw-baseline in graphs +
+  non-decode fused compiled outside them). The required acceptance gate is a
+  **fresh 462x256 test** (462 input tokens, 256 output tokens) on the target
+  hardware: startup, memory profiling, and ACL graph captures must complete
+  without stale-comm errors or OOM; a multi-request random serving run at
+  QPS 4 must complete with exact requested lengths and no request errors;
+  and a deterministic completion after MIXED/FUSED traffic must succeed,
+  proving the captured decode graphs remain reusable after the fused
+  non-decode phase. A performance comparison against a fresh stock control is
+  a separate, follow-on measurement; mechanism and numerical correctness come
+  first.
+
+## Unit-test contract
+
+`tests/ut/test_ascend_forward_context.py` and `tests/ut/test_ascend_config.py`
+encode: the selector truth table (decode baseline on A2/TP2 and A3;
+`PURE_PREFILL`/`MIXED` fused under gate; **gate-fail raises `ValueError`
+fail-fast, never a baseline fallback**; `enable_fused_mc2 != 1` rejected at
+startup; A5/310P; draft/non-MoE/`phase=None`), default compatibility
+(policy OFF identical to stock for every phase), strict config parsing
+(default OFF, `non_decode_fused` accepted, bool-like aliases and the retired
+`mixed_prefill_fused` spelling raise), fail-closed validation (DP / V2 /
+cudagraph mode / `enable_fused_mc2 != 1`), the hybrid-active predicate
+(`PURE_PREFILL` + `MIXED` only), the bypass-compiled predicate (decode only),
+the force-eager predicate (non-decode only), the **2x2 matrix invariant** (the
+two controls never combine on one phase), `skip_compiled` propagation through
+`set_ascend_forward_context`, and the explicit profile/warmup ordering helper
+(`get_moe_phase_hybrid_warmup_phase`). Runner-level tests assert that under
+the active policy `profile_run` issues the fused `MIXED` dummy
+**unconditionally and first** (including `max_num_tokens <= capacity` and
+non-MC2 selector results, with size `min(max_num_tokens, capacity)`), while
+policy OFF keeps the historical conditional `PURE_PREFILL` dummy; worker-level
+tests assert compile warmups pass the explicit `MIXED` phase under the policy
+and stay positional `_dummy_run(size)` when OFF, including the empty-warmup
+case.
 
 ## Residual risks and next experiments
 
-- The same-NZ pilot is negative at 462->16 / QPS 4: throughput is flat and
-  latency regresses. Keep the policy experimental and default-off; do not
-  merge or promote it as an optimization without a new mechanism that avoids
-  the eager-boundary cost and fresh evidence on mixed-rich traffic.
-- Decode layout disclosure: the 2x910B2 discriminator found NZ stock decode
-  3.82--16.68% faster than ND across capacities 2--32. Historical ND parity is
-  disproven; use a fresh control and name the hybrid arm "baseline comm on NZ
-  weights" rather than unchanged stock decode.
-- Only the MIXED phase is included by design. Extending to `PURE_PREFILL`
-  fused requires separate measurement and its own validation.
-- The TraceLoom numbers suggest the profit region may not match the current
-  `MIXED` direction on every SoC/capacity; the mechanism is what is delivered.
-  Per-phase/per-capacity crossover must be measured before any change to the
-  default.
+- The corrected mechanism is **not yet real-model validated**. The required
+  fresh 462x256 gate (see above) must pass before any performance claim; the
+  retired pilot's numbers apply to the old boundary and must not be quoted
+  for this design.
+- Raw decode inside ACL graphs is a new execution shape for the experiment:
+  watch workspace sizing, capture stability, and graph pool memory during the
+  fresh gate.
+- Decode layout disclosure: the hybrid decode arm is baseline comm on NZ
+  weights, not the historical ND stock decode. Compare against a fresh
+  control (same `enable_fused_mc2=1` arm with `moe_phase_hybrid_policy=off`).
 - Token-count thresholds inside a phase remain forbidden; if a capacity-based
   selector is ever needed it must become a new policy value with its own
   validation, not a per-wave object swap.
-- V2 runner support requires upstream `skip_compiled` plumbing (out of scope).
+- V2 runner support requires upstream `skip_compiled`/`force_eager` plumbing
+  (out of scope).
 - DP > 1 support requires a cross-rank phase agreement protocol (out of scope).

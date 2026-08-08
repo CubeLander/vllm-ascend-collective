@@ -437,13 +437,29 @@ class TestAscendConfig(TestBase):
 
     @_clean_up_ascend_config
     @patch("vllm_ascend.platform.NPUPlatform.check_and_update_config")
-    def test_init_ascend_config_moe_phase_hybrid_policy_mixed(self, mock_fix_incompatible_config):
-        """additional_config.moe_phase_hybrid_policy=mixed_prefill_fused is honored."""
+    def test_init_ascend_config_moe_phase_hybrid_policy_non_decode_fused(self, mock_fix_incompatible_config):
+        """additional_config.moe_phase_hybrid_policy=non_decode_fused is honored."""
+        test_vllm_config = VllmConfig()
+        test_vllm_config.additional_config = {"moe_phase_hybrid_policy": "non_decode_fused"}
+        ascend_config = init_ascend_config(test_vllm_config)
+        self.assertIs(ascend_config.moe_phase_hybrid_policy, MoEPhaseHybridPolicy.NON_DECODE_FUSED)
+        self.assertIs(get_ascend_config().moe_phase_hybrid_policy, MoEPhaseHybridPolicy.NON_DECODE_FUSED)
+
+    @_clean_up_ascend_config
+    @patch("vllm_ascend.platform.NPUPlatform.check_and_update_config")
+    def test_init_ascend_config_moe_phase_hybrid_policy_rejects_retired_spelling(self, mock_fix_incompatible_config):
+        """The retired mixed_prefill_fused spelling fails closed.
+
+        The earlier pilot value encoded the wrong over-narrow semantics
+        (MIXED-only fused + non-decode bypassing the compiled model). Silently
+        mapping it onto the corrected non_decode_fused behavior would change
+        the graph behavior that pilot actually ran with, so it is rejected
+        with a pointer to the current spelling.
+        """
         test_vllm_config = VllmConfig()
         test_vllm_config.additional_config = {"moe_phase_hybrid_policy": "mixed_prefill_fused"}
-        ascend_config = init_ascend_config(test_vllm_config)
-        self.assertIs(ascend_config.moe_phase_hybrid_policy, MoEPhaseHybridPolicy.MIXED_PREFILL_FUSED)
-        self.assertIs(get_ascend_config().moe_phase_hybrid_policy, MoEPhaseHybridPolicy.MIXED_PREFILL_FUSED)
+        with self.assertRaisesRegex(ValueError, "non_decode_fused"):
+            init_ascend_config(test_vllm_config)
 
     @_clean_up_ascend_config
     @patch("vllm_ascend.platform.NPUPlatform.check_and_update_config")
@@ -451,10 +467,23 @@ class TestAscendConfig(TestBase):
         """An unrecognized policy value fails closed at config construction.
 
         The policy is an explicit enum/string: bool-like aliases
-        (0/1/true/false/on/none/...) are deliberately rejected so the switch
-        cannot be set ambiguously.
+        (0/1/true/false/on/none/...) and the retired mixed_prefill_fused
+        spelling are deliberately rejected so the switch cannot be set
+        ambiguously.
         """
-        for value in ["", "prefill_fused", "0", "1", "true", "false", "on", "none", "enabled", "2"]:
+        for value in [
+            "",
+            "prefill_fused",
+            "mixed_prefill_fused",
+            "0",
+            "1",
+            "true",
+            "false",
+            "on",
+            "none",
+            "enabled",
+            "2",
+        ]:
             test_vllm_config = VllmConfig()
             test_vllm_config.additional_config = {"moe_phase_hybrid_policy": value}
             with self.subTest(value=value), self.assertRaisesRegex(ValueError, "moe_phase_hybrid_policy"):
