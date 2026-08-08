@@ -300,28 +300,44 @@ MIXED kernel alone: it changed both the decode communication family and the
 compiled/eager boundary. Raw local receipts are under
 `.lumi-workbench/artifacts/moe-phase-hybrid-pilot-20260808/`.
 
-## Raw-decode graph risk and required fresh test
+## Raw-decode graph gate and crossed result
 
 The corrected design moves decode **out of the compiled artifact and into raw
-ops inside FULL_DECODE_ONLY ACL graphs**. That carries risks the retired pilot
-did not exercise and which the 462/16 pilot cannot validate:
+ops inside FULL_DECODE_ONLY ACL graphs**. That carried risks the retired pilot
+did not exercise and which the 462/16 pilot could not validate.
 
-- **Raw decode graph behavior**: uncompiled decode changes which kernels and
-  workspace allocations live inside the captured graphs (raw baseline comm
-  ops instead of the compiled decode artifact). Graph capture/replay,
-  workspace sizing, and graph memory must be revalidated on real hardware.
-- **Mixed traffic shape**: the pilot's 462 input / 16 output traffic never
-  measured the corrected phase split (decode raw-baseline in graphs +
-  non-decode fused compiled outside them). The required acceptance gate is a
-  **fresh 462x256 test** (462 input tokens, 256 output tokens) on the target
-  hardware: startup, memory profiling, and ACL graph captures must complete
-  without stale-comm errors or OOM; a multi-request random serving run at
-  QPS 4 must complete with exact requested lengths and no request errors;
-  and a deterministic completion after MIXED/FUSED traffic must succeed,
-  proving the captured decode graphs remain reusable after the fused
-  non-decode phase. A performance comparison against a fresh stock control is
-  a separate, follow-on measurement; mechanism and numerical correctness come
-  first.
+The mechanism gate now passes on 2x910B2 with Qwen3-30B-A3B BF16, TP2/EP2,
+DP1, and capture sizes 2/4/8/16/32. The explicit MIXED profile dummy selected
+FUSED_MC2 and compiled first; every decode warmup/capture selected baseline
+ALLGATHER; 14 ACL graphs captured; runtime PURE_PREFILL/MIXED remained fused
+outside ACL while 93 decode steps replayed baseline graphs. The 8-request
+462/16 correctness gate and a deterministic post-MIXED completion passed with
+no stale object, unexpected recompile, OOM, 507015, or request error. The raw
+local receipt is
+`.lumi-workbench/artifacts/nondecode-fused-realmodel-gate-20260808/`.
+
+A subsequent same-NZ, crossed-order comparison used the historical 462 input /
+256 output / QPS 4 workload. Both arms kept `enable_fused_mc2=1` and therefore
+used the same NZ weights and fused compiled non-decode lane. The corrected arm
+changed only pure-decode execution from the control's compiled FUSED_MC2 graph
+to a raw baseline-ALLGATHER ACL graph. All four cells completed 32/32 requests
+at exact requested lengths with zero failures:
+
+| metric | pair 1 (control first) | pair 2 (corrected first) | mean direction |
+|---|---:|---:|---:|
+| request throughput | -8.0% | -6.0% | **-7.0%** |
+| median TTFT | +6.2% | +19.3% | **+13.1%** |
+| mean TPOT | +13.2% | +13.1% | **+13.1%** |
+| median TPOT | +14.9% | +13.6% | **+14.2%** |
+| median ITL | +19.2% | +14.6% | **+16.9%** |
+
+The stable metrics agree across reversed order: **the raw-baseline decode graph
+is slower than the compiled-fused control on this workload.** This result does
+not establish that a *compiled* baseline decode graph is slower. The corrected
+arm changed both the decode comm family and the decode compiled/raw boundary;
+TraceLoom's earlier local fused-window regression cannot compensate for losing
+compile transformations elsewhere in the graph. The raw comparison receipt is
+`.lumi-workbench/artifacts/nondecode-fused-462x256-crossed-20260808/`.
 
 ## Unit-test contract
 
@@ -349,13 +365,14 @@ case.
 
 ## Residual risks and next experiments
 
-- The corrected mechanism is **not yet real-model validated**. The required
-  fresh 462x256 gate (see above) must pass before any performance claim; the
-  retired pilot's numbers apply to the old boundary and must not be quoted
-  for this design.
-- Raw decode inside ACL graphs is a new execution shape for the experiment:
-  watch workspace sizing, capture stability, and graph pool memory during the
-  fresh gate.
+- The corrected mechanism is real-model validated, but its raw-baseline decode
+  graph loses 6--8% request throughput and about 13% mean TPOT in the crossed
+  462x256 comparison. Keep it experimental/default-off; do not promote it as
+  an optimization.
+- The remaining technical discriminator is a **compiled baseline decode ACL
+  graph** alongside the compiled fused non-decode lane. More workload sweeps
+  of the current raw design are not justified: they would measure the known
+  compiled/raw confound rather than resolve it.
 - Decode layout disclosure: the hybrid decode arm is baseline comm on NZ
   weights, not the historical ND stock decode. Compare against a fresh
   control (same `enable_fused_mc2=1` arm with `moe_phase_hybrid_policy=off`).
