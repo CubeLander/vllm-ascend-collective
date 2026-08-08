@@ -2159,11 +2159,14 @@ class NPUModelRunner(GPUModelRunner):
                 # with_prefill); never from a device tensor .item() sync.
                 moe_forward_phase = classify_forward_phase(self.attn_state, self.with_prefill)
                 # Two independent phase-keyed decisions (2x2 matrix):
-                # - PURE_DECODE bypasses the torch.compile/AOT artifact
-                #   (skip_compiled=True, applied inside
-                #   set_ascend_forward_context) and keeps force_eager=False so
-                #   FULL_DECODE_ONLY captures/replays raw baseline ops.
-                # - PURE_PREFILL/MIXED keep skip_compiled=False (fused
+                # - PURE_DECODE keeps skip_compiled=False (one compiled outer
+                #   artifact shared by every phase; it contains only opaque
+                #   torch.ops.vllm.moe_forward calls, and the live
+                #   _forward_impl dispatch happens at op runtime) and keeps
+                #   force_eager=False so FULL_DECODE_ONLY captures/replays
+                #   the compiled outer artifact with the baseline comm family
+                #   selected at op runtime.
+                # - PURE_PREFILL/MIXED keep skip_compiled=False (same fused
                 #   torch.compile artifact) and force_eager=True so they can
                 #   never be dispatched into or replayed from a decode graph,
                 #   even when uniform_decode misclassifies a 1-token prefill.
@@ -2202,7 +2205,8 @@ class NPUModelRunner(GPUModelRunner):
                     # outer ACLGraphWrapper and run the fused torch.compile
                     # artifact; they are never captured into, or replayed
                     # from, a decode graph. PURE_DECODE keeps force_eager=False
-                    # so FULL capture/replay of the raw baseline proceeds.
+                    # so FULL capture/replay of the compiled outer artifact
+                    # proceeds (opaque op -> baseline comm family at runtime).
                     force_eager=self.model_config.enforce_eager or moe_phase_hybrid_force_eager,
                     num_encoder_reqs=len(scheduler_output.scheduled_encoder_inputs),
                 )
@@ -3795,8 +3799,9 @@ class NPUModelRunner(GPUModelRunner):
             # under the gate). This runs BEFORE any decode warmup/capture, so
             # the fused torch.compile artifact is deterministically compiled
             # first and its workspace is included in memory profiling, and the
-            # raw baseline decode workspace is profiled by the later decode
-            # capture. The default-off path keeps the historical PURE_PREFILL
+            # baseline decode workspace (selected at opaque-op runtime) is
+            # profiled by the later decode capture. The default-off path keeps
+            # the historical PURE_PREFILL
             # dummy unchanged.
             profile_moe_phase = get_moe_phase_hybrid_warmup_phase(self.vllm_config) or MoEForwardPhase.PURE_PREFILL
             self._dummy_run(

@@ -25,7 +25,15 @@ template kept the first object's layout. That patch was withdrawn. A safe hybrid
 needs exactly one comm object family inside every compiled/ACL template. The
 corrected policy achieves this by giving **decode** and **non-decode** separate
 execution lanes (see "Two independent decisions" below), so no template ever
-changes comm family at runtime.
+changes comm family at runtime. The current canary design additionally makes
+the outer compiled graph **opaque with respect to MoE**: under the policy the
+Ascend runner selects the already-registered opaque
+`torch.ops.vllm.moe_forward` / `torch.ops.vllm.moe_forward_shared` custom ops
+(upstream `runner/moe_runner.py`) instead of the raw PrivateUse1
+`_moe_forward` functions, so `torch.compile` traces only the op call and the
+live `_forward_impl` dispatch happens at op runtime. That is what lets every
+phase share one compiled outer artifact while the comm family is chosen per
+phase at op runtime.
 
 ## Configuration
 
@@ -48,7 +56,7 @@ baseline family.
 | value | meaning |
 |---|---|
 | `off` (default when missing) | stock selector, byte-for-byte; no phase keying, no dispatch changes |
-| `non_decode_fused` | `PURE_DECODE` runs the baseline comm family as raw ops inside the FULL_DECODE_ONLY ACL graphs (`skip_compiled=True`, `force_eager=False`); `PURE_PREFILL` and `MIXED` run `FUSED_MC2` through the single fused torch.compile/AOT artifact outside the ACL graphs (`skip_compiled=False`, `force_eager=True`). If the static fused-MC2 capability gate is unavailable, selection **raises a deterministic `ValueError`** (fail fast) instead of ever falling back to the baseline family |
+| `non_decode_fused` | `PURE_DECODE` selects the baseline comm family, dispatched at opaque-op runtime inside the one compiled outer artifact (`skip_compiled=False`, `force_eager=False`) that FULL_DECODE_ONLY ACL graphs capture and replay; `PURE_PREFILL` and `MIXED` run `FUSED_MC2` through the same single compiled outer artifact outside the ACL graphs (`skip_compiled=False`, `force_eager=True`). If the static fused-MC2 capability gate is unavailable, selection **raises a deterministic `ValueError`** (fail fast) instead of ever falling back to the baseline family |
 
 The accepted values are exactly `off` and `non_decode_fused`. Bool-like
 aliases (`0`/`1`/`true`/`false`/`on`/`none`/...) are deliberately rejected so
@@ -72,7 +80,7 @@ distinguishes, from the v1 runner's `attn_state`/`with_prefill` CPU state:
   already have computed tokens (`ChunkedPrefill` / `PrefillCacheHit`).
 
 `PURE_PREFILL` and `MIXED` are the **fused non-decode** lanes; `PURE_DECODE`
-is the **raw baseline** lane. There is no token-count-dependent selection
+is the **baseline** lane. There is no token-count-dependent selection
 anywhere: per-wave token thresholds are exactly what historically swapped the
 comm object inside one compiled template.
 
@@ -83,16 +91,19 @@ derives one from the other:
 
 | phase | `skip_compiled` (torch.compile/AOT) | `force_eager` (ACL dispatch) | result |
 |---|---|---|---|
-| `PURE_DECODE` | `True` | `False` | raw baseline comm ops captured/replayed by FULL_DECODE_ONLY ACL graphs |
-| `PURE_PREFILL` | `False` | `True` | fused `FUSED_MC2` via the one torch.compile/AOT artifact, ACL mode NONE |
-| `MIXED` | `False` | `True` | fused `FUSED_MC2` via the one torch.compile/AOT artifact, ACL mode NONE |
+| `PURE_DECODE` | `False` | `False` | baseline comm family selected at opaque-op runtime inside the one compiled outer artifact, captured/replayed by FULL_DECODE_ONLY ACL graphs |
+| `PURE_PREFILL` | `False` | `True` | fused `FUSED_MC2` via the same one compiled outer artifact, ACL mode NONE |
+| `MIXED` | `False` | `True` | fused `FUSED_MC2` via the same one compiled outer artifact, ACL mode NONE |
 | policy OFF / `phase=None` / draft | stock | stock | byte-for-byte stock behavior |
 
-- `skip_compiled=True` (only `PURE_DECODE` under the policy) bypasses the
-  compiled model call (`ForwardContext.skip_compiled`, honored by upstream
-  `vllm/compilation/decorators.py`), so the decode ACL graphs embed the raw
-  baseline ops — never the fused artifact, and never whatever comm the stock
-  selector would have baked under `enable_fused_mc2=1`.
+- `skip_compiled` is **retired under the canary**: it stays `False` for every
+  phase. The outer compiled graph contains only opaque
+  `torch.ops.vllm.moe_forward` calls and the live `_forward_impl` dispatch
+  happens at op runtime, so decode shares the one compiled outer artifact with
+  the non-decode phases; the comm family (baseline vs `FUSED_MC2`) is chosen
+  per phase at op runtime, never baked into the compiled graph. An unmatched
+  decode wave therefore safely runs the compiled outer graph with the
+  baseline family dispatched at op runtime.
 - `force_eager=True` (only `PURE_PREFILL`/`MIXED` under the policy) forces
   `CUDAGraphMode.NONE` in `_determine_batch_execution_and_padding`, so the
   outer `ACLGraphWrapper` falls through and the wave runs the fused compiled
@@ -158,18 +169,19 @@ else `ALLGATHER`; A3 → `MC2` within MC2 capacity else `ALLTOALL`; 310P →
 ## Why this cannot reproduce the historical stale-layout failure
 
 1. **One template = one comm family.** The decode ACL templates are captured
-   from the raw baseline forward (`skip_compiled=True` + baseline selector),
-   and that is exactly what runtime decode replays. The fused non-decode path
-   runs through the one torch.compile/AOT artifact outside the ACL graphs; the
-   artifact is only ever traced with the non-decode context, which always
-   selects the same family for a given process (the SoC gate result is
-   static). No phase and no token threshold can swap a comm object inside any
-   template.
-2. **The compiled artifact never serves decode.** Decode bypasses
-   `torch.compile` entirely, so the fused artifact and the raw decode graphs
-   are disjoint execution lanes. An unmatched/runtime decode wave that falls
-   through the ACL wrapper (mode NONE) still runs the raw baseline forward
-   because `skip_compiled` remains `True` for decode.
+   from the compiled outer artifact with the baseline selector, and the comm
+   family is dispatched at opaque-op runtime during capture; runtime decode
+   replays exactly what was captured. The fused non-decode path runs through
+   the same one torch.compile/AOT artifact outside the ACL graphs; the op
+   runtime dispatch always selects the same family for a given process (the
+   SoC gate result is static). No phase and no token threshold can swap a comm
+   object inside any template.
+2. **The compiled outer artifact is phase-agnostic.** It contains only opaque
+   `torch.ops.vllm.moe_forward` calls, so the same artifact serves decode and
+   non-decode; the baseline/fused choice happens in `_forward_impl` at op
+   runtime. An unmatched/runtime decode wave that falls through the ACL
+   wrapper (mode NONE) safely runs the compiled outer graph with the baseline
+   family dispatched at op runtime.
 
 **No ACL cache-key change is needed.** `ACLGraphWrapper`/`compute_acl_graph_cache_key`
 are untouched. Additionally the policy is **deliberately token-count
@@ -179,7 +191,7 @@ independent**; no `num_tokens >= N` logic exists in the hybrid selector.
 
 The requirement is that the fused non-decode compile and its workspace are
 deterministically established **before** any decode warmup/capture, and that
-memory profiling includes both the FUSED workspace and the raw baseline
+memory profiling includes both the FUSED workspace and the baseline
 workspace.
 
 - `profile_run` (v1 runner): when the policy is active the fused non-decode
@@ -198,20 +210,21 @@ workspace.
   `PURE_PREFILL` phase).
 - Capture warmup (`_warmup_and_capture` -> `_dummy_run`, and `capture_model`)
   only runs decode-style dummy runs (`with_prefill=False` -> `PURE_DECODE`),
-  so every captured graph is a raw baseline decode template, exactly matching
-  runtime decode under the policy. The decode warmup allocates the raw
-  baseline workspace inside the memory-profiling window, so the profile
-  records both workspaces.
+  so every captured graph is a decode template of the compiled outer artifact
+  with the baseline family selected at opaque-op runtime — exactly matching
+  runtime decode under the policy, with no retrace. The decode warmup
+  allocates the baseline workspace inside the memory-profiling window, so the
+  profile records both workspaces.
 - `_dummy_run` defaults to the same host phase classification
   (`PURE_PREFILL` if `with_prefill` else `PURE_DECODE`), accepts an explicit
   phase override, and applies the same phase-keyed `force_eager` as the
   runtime forward, so a non-decode dummy can never capture a fused template
   into the decode graph pool.
 - `compile_or_warm_up_model` (worker): the generic compile-size warmups pass
-  the explicit non-decode phase under the policy. Otherwise they would
-  default to decode, which under the policy bypasses the compiled model and
-  would never compile the fused artifact at those sizes before decode
-  capture. Policy off keeps the historical `_dummy_run(size)` behavior.
+  the explicit non-decode phase under the policy. This keeps the fused
+  non-decode lane deterministically compiled first and its workspace
+  established before decode warmup/capture. Policy off keeps the historical
+  `_dummy_run(size)` behavior.
 
 ## Weight-layout compatibility audit
 
@@ -300,13 +313,20 @@ MIXED kernel alone: it changed both the decode communication family and the
 compiled/eager boundary. Raw local receipts are under
 `.lumi-workbench/artifacts/moe-phase-hybrid-pilot-20260808/`.
 
-## Raw-decode graph gate and crossed result
+## Raw-decode ACL graph gate and crossed result (retired as measured fallback)
 
-The corrected design moves decode **out of the compiled artifact and into raw
-ops inside FULL_DECODE_ONLY ACL graphs**. That carried risks the retired pilot
-did not exercise and which the 462/16 pilot could not validate.
+**Retired as the current design.** The intermediate raw-decode mechanism moved
+decode **out of the compiled artifact and into raw ops inside FULL_DECODE_ONLY
+ACL graphs** (`skip_compiled=True` on `PURE_DECODE`). It is kept in this
+document only as a **measured fallback**: the crossed comparison below is the
+evidence for what the raw capture costs, and the current opaque-MoE canary is
+the remaining discriminator that the raw design could not resolve (a
+*compiled* baseline decode ACL graph alongside the compiled fused non-decode
+lane). Under the canary, `skip_compiled` is retired and decode runs the one
+compiled outer artifact with the baseline family selected at opaque-op
+runtime, so the raw design's compile/raw confound is gone.
 
-The mechanism gate now passes on 2x910B2 with Qwen3-30B-A3B BF16, TP2/EP2,
+The raw mechanism gate passed on 2x910B2 with Qwen3-30B-A3B BF16, TP2/EP2,
 DP1, and capture sizes 2/4/8/16/32. The explicit MIXED profile dummy selected
 FUSED_MC2 and compiled first; every decode warmup/capture selected baseline
 ALLGATHER; 14 ACL graphs captured; runtime PURE_PREFILL/MIXED remained fused
@@ -333,28 +353,38 @@ at exact requested lengths with zero failures:
 
 The stable metrics agree across reversed order: **the raw-baseline decode graph
 is slower than the compiled-fused control on this workload.** This result does
-not establish that a *compiled* baseline decode graph is slower. The corrected
-arm changed both the decode comm family and the decode compiled/raw boundary;
+not establish that a *compiled* baseline decode graph is slower: the raw arm
+changed both the decode comm family and the decode compiled/raw boundary, and
 TraceLoom's earlier local fused-window regression cannot compensate for losing
-compile transformations elsewhere in the graph. The raw comparison receipt is
-`.lumi-workbench/artifacts/nondecode-fused-462x256-crossed-20260808/`.
+compile transformations elsewhere in the graph. The canary's whole point is to
+measure the remaining discriminator without that confound. The raw comparison
+receipt is `.lumi-workbench/artifacts/nondecode-fused-462x256-crossed-20260808/`.
 
 ## Unit-test contract
 
-`tests/ut/test_ascend_forward_context.py` and `tests/ut/test_ascend_config.py`
-encode: the selector truth table (decode baseline on A2/TP2 and A3;
-`PURE_PREFILL`/`MIXED` fused under gate; **gate-fail raises `ValueError`
-fail-fast, never a baseline fallback**; `enable_fused_mc2 != 1` rejected at
-startup; A5/310P; draft/non-MoE/`phase=None`), default compatibility
-(policy OFF identical to stock for every phase), strict config parsing
-(default OFF, `non_decode_fused` accepted, bool-like aliases and the retired
-`mixed_prefill_fused` spelling raise), fail-closed validation (DP / V2 /
-cudagraph mode / `enable_fused_mc2 != 1`), the hybrid-active predicate
-(`PURE_PREFILL` + `MIXED` only), the bypass-compiled predicate (decode only),
-the force-eager predicate (non-decode only), the **2x2 matrix invariant** (the
-two controls never combine on one phase), `skip_compiled` propagation through
-`set_ascend_forward_context`, and the explicit profile/warmup ordering helper
-(`get_moe_phase_hybrid_warmup_phase`). Runner-level tests assert that under
+`tests/ut/test_ascend_forward_context.py`, `tests/ut/ops/test_moe_opaque_canary.py`
+and `tests/ut/test_ascend_config.py` encode: the selector truth table (decode
+baseline on A2/TP2 and A3; `PURE_PREFILL`/`MIXED` fused under gate;
+**gate-fail raises `ValueError` fail-fast, never a baseline fallback**;
+`enable_fused_mc2 != 1` rejected at startup; A5/310P; draft/non-MoE/
+`phase=None`), default compatibility (policy OFF identical to stock for every
+phase), strict config parsing (default OFF, `non_decode_fused` accepted,
+bool-like aliases and the retired `mixed_prefill_fused` spelling raise),
+fail-closed validation (DP / V2 / cudagraph mode / `enable_fused_mc2 != 1`),
+the hybrid-active predicate (`PURE_PREFILL` + `MIXED` only), the
+bypass-compiled predicate **retired to constant `False` under the opaque
+canary** (`skip_compiled` is false for every phase), the force-eager predicate
+(non-decode only), the **2x2 matrix invariant** (the two controls never
+combine on one phase: decode is `(False, False)`, non-decode is
+`(False, True)`), `skip_compiled` propagation through
+`set_ascend_forward_context`, the explicit profile/warmup ordering helper
+(`get_moe_phase_hybrid_warmup_phase`), and the opaque-selection contract
+(`AscendMoERunner._select_forward`: policy ON returns
+`torch.ops.vllm.moe_forward` / `torch.ops.vllm.moe_forward_shared`; policy OFF
+delegates to `super()._select_forward()` byte-for-byte, which on
+PrivateUse1/Ascend is the raw `_moe_forward` / `_moe_forward_shared`
+selection; an unavailable policy config cannot change stock selection; the
+info-once marker fires at most once). Runner-level tests assert that under
 the active policy `profile_run` issues the fused `MIXED` dummy
 **unconditionally and first** (including `max_num_tokens <= capacity` and
 non-MC2 selector results, with size `min(max_num_tokens, capacity)`), while
@@ -365,14 +395,29 @@ case.
 
 ## Residual risks and next experiments
 
-- The corrected mechanism is real-model validated, but its raw-baseline decode
-  graph loses 6--8% request throughput and about 13% mean TPOT in the crossed
-  462x256 comparison. Keep it experimental/default-off; do not promote it as
-  an optimization.
-- The remaining technical discriminator is a **compiled baseline decode ACL
-  graph** alongside the compiled fused non-decode lane. More workload sweeps
-  of the current raw design are not justified: they would measure the known
-  compiled/raw confound rather than resolve it.
+- The raw-baseline decode graph is **retired as a measured fallback**: it
+  loses 6--8% request throughput and about 13% mean TPOT in the crossed
+  462x256 comparison (see the retired section above). The current canary
+  measures the remaining discriminator — a **compiled baseline decode ACL
+  graph** (opaque `torch.ops.vllm.moe_forward` at op-runtime baseline
+  dispatch) alongside the compiled fused non-decode lane — without the raw
+  compile/raw confound.
+- The opaque-op path is the canary's core open risk: upstream keeps the
+  PrivateUse1/Ascend dispatch on the raw `_moe_forward` functions because
+  `torch.ops.vllm.moe_forward` custom ops have known dispatch compatibility
+  issues on NPU. This canary is exactly the probe for whether the opaque op
+  dispatches cleanly at runtime on Ascend. If it does not, the exact blocker
+  must be reported and the policy must not be promoted; selection in CPU
+  tests proves only registration/import, never NPU dispatch.
+- Stale out-of-scope text: the `MoEPhaseHybridPolicy` enum docstring in
+  `vllm_ascend/ascend_config.py`, the worker warmup comment in
+  `vllm_ascend/worker/worker.py`, and the platform comment in
+  `vllm_ascend/platform.py` still describe the retired raw-capture decode
+  (`skip_compiled=True`); they were outside this canary's assigned file set
+  and should be corrected when the design settles.
+- Decode layout disclosure: the hybrid decode arm is baseline comm on NZ
+  weights, not the historical ND stock decode. Compare against a fresh
+  control (same `enable_fused_mc2=1` arm with `moe_phase_hybrid_policy=off`).
 - Decode layout disclosure: the hybrid decode arm is baseline comm on NZ
   weights, not the historical ND stock decode. Compare against a fresh
   control (same `enable_fused_mc2=1` arm with `moe_phase_hybrid_policy=off`).

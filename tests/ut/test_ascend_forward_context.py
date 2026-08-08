@@ -245,7 +245,9 @@ def _make_hybrid_moe_config(
 
 
 def test_is_moe_phase_hybrid_active_non_decode_only():
-    """PURE_PREFILL and MIXED are hybrid-active; PURE_DECODE is excluded."""
+    """PURE_PREFILL and MIXED are hybrid-active; PURE_DECODE is excluded
+    (it selects the baseline comm family inside the FULL_DECODE_ONLY ACL
+    graphs at opaque-op runtime)."""
     vllm_config = _with_hybrid_policy(_make_hybrid_moe_config(8, num_experts=64), "non_decode_fused")
     with patch("vllm_ascend.ascend_forward_context.is_moe_model", return_value=True):
         assert is_moe_phase_hybrid_active(MoEForwardPhase.PURE_PREFILL, vllm_config) is True
@@ -258,21 +260,20 @@ def test_is_moe_phase_hybrid_active_non_decode_only():
             assert is_moe_phase_hybrid_active(MoEForwardPhase.MIXED, vllm_config) is False
 
 
-def test_should_skip_compiled_for_moe_phase_hybrid_decode_only():
-    """skip_compiled under the policy applies ONLY to PURE_DECODE: decode
-    runs the raw baseline comm ops so FULL_DECODE_ONLY ACL graphs capture and
-    replay exactly those raw ops. PURE_PREFILL/MIXED keep the compiled
-    (fused torch.compile) path."""
+def test_should_skip_compiled_for_moe_phase_hybrid_false_every_phase():
+    """The bypass-compiled predicate is RETIRED under the opaque-MoE canary.
+
+    The outer compiled graph contains only opaque torch.ops.vllm.moe_forward
+    calls (live _forward_impl dispatch happens at op runtime), so decode no
+    longer bypasses the compiled artifact: every phase shares the one
+    compiled outer artifact and skip_compiled is False for all of them."""
     vllm_config = _with_hybrid_policy(_make_hybrid_moe_config(8, num_experts=64), "non_decode_fused")
     with patch("vllm_ascend.ascend_forward_context.is_moe_model", return_value=True):
-        assert should_skip_compiled_for_moe_phase_hybrid(MoEForwardPhase.PURE_DECODE, vllm_config) is True
-        assert should_skip_compiled_for_moe_phase_hybrid(MoEForwardPhase.PURE_PREFILL, vllm_config) is False
-        assert should_skip_compiled_for_moe_phase_hybrid(MoEForwardPhase.MIXED, vllm_config) is False
-        assert should_skip_compiled_for_moe_phase_hybrid(None, vllm_config) is False
-        assert (
-            should_skip_compiled_for_moe_phase_hybrid(MoEForwardPhase.PURE_DECODE, vllm_config, is_draft_model=True)
-            is False
-        )
+        for phase in (MoEForwardPhase.PURE_DECODE, MoEForwardPhase.PURE_PREFILL, MoEForwardPhase.MIXED, None):
+            assert should_skip_compiled_for_moe_phase_hybrid(phase, vllm_config) is False, f"phase={phase}"
+            assert (
+                should_skip_compiled_for_moe_phase_hybrid(phase, vllm_config, is_draft_model=True) is False
+            ), f"phase={phase} draft"
         with patch("vllm_ascend.ascend_forward_context.is_moe_model", return_value=False):
             assert should_skip_compiled_for_moe_phase_hybrid(MoEForwardPhase.PURE_DECODE, vllm_config) is False
     off_config = _with_hybrid_policy(_make_hybrid_moe_config(8, num_experts=64), "off")
@@ -306,15 +307,18 @@ def test_should_force_eager_for_moe_phase_hybrid_non_decode_only():
 def test_moe_phase_hybrid_2x2_matrix_invariant():
     """The two phase-keyed decisions are independent and never combine.
 
-    Under the policy each phase gets exactly one of the two controls:
-    PURE_DECODE -> (skip_compiled=True, force_eager=False); PURE_PREFILL /
-    MIXED -> (skip_compiled=False, force_eager=True). skip_compiled is never
-    fed into force_eager. Policy off and phase=None get neither control.
+    Under the opaque-MoE canary policy, skip_compiled is False for every
+    phase (all phases share the one compiled outer artifact); the remaining
+    control is force_eager: PURE_PREFILL / MIXED -> (skip_compiled=False,
+    force_eager=True); PURE_DECODE -> (skip_compiled=False,
+    force_eager=False) so FULL capture/replay proceeds. skip_compiled is
+    never fed into force_eager. Policy off and phase=None get neither
+    control.
     """
     vllm_config = _with_hybrid_policy(_make_hybrid_moe_config(8, num_experts=64), "non_decode_fused")
     with patch("vllm_ascend.ascend_forward_context.is_moe_model", return_value=True):
         for phase, expected_skip, expected_eager in [
-            (MoEForwardPhase.PURE_DECODE, True, False),
+            (MoEForwardPhase.PURE_DECODE, False, False),
             (MoEForwardPhase.PURE_PREFILL, False, True),
             (MoEForwardPhase.MIXED, False, True),
             (None, False, False),
@@ -629,16 +633,18 @@ def _make_forward_context_mocks():
         ("off", MoEForwardPhase.PURE_DECODE, False, MoECommType.FUSED_MC2),
         ("off", MoEForwardPhase.PURE_PREFILL, False, MoECommType.FUSED_MC2),
         ("off", MoEForwardPhase.MIXED, False, MoECommType.FUSED_MC2),
-        ("non_decode_fused", MoEForwardPhase.PURE_DECODE, True, MoECommType.MC2),
+        ("non_decode_fused", MoEForwardPhase.PURE_DECODE, False, MoECommType.MC2),
         ("non_decode_fused", MoEForwardPhase.PURE_PREFILL, False, MoECommType.FUSED_MC2),
         ("non_decode_fused", MoEForwardPhase.MIXED, False, MoECommType.FUSED_MC2),
         ("non_decode_fused", None, False, MoECommType.FUSED_MC2),
     ],
 )
 def test_set_ascend_forward_context_hybrid_skip_compiled(policy_value, phase, expected_skip_compiled, expected_comm):
-    """skip_compiled=True under the policy ONLY for PURE_DECODE, so the
-    FULL_DECODE_ONLY ACL graphs capture raw baseline ops. PURE_PREFILL/MIXED
-    keep the compiled (fused torch.compile) path and select FUSED_MC2."""
+    """skip_compiled stays False for EVERY phase under the opaque policy:
+    all phases share the one compiled outer artifact, and the comm family is
+    selected per phase at op runtime (PURE_DECODE baseline, PURE_PREFILL /
+    MIXED FUSED_MC2). The context only propagates the runner's own
+    skip_compiled (encoder inputs)."""
     captured = {}
 
     @contextmanager
