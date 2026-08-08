@@ -287,11 +287,49 @@ local raw receipt is
 the exact commands, hashes, phase logs, client JSON, and before/after device
 state.
 
+## Same-NZ performance pilot
+
+A bounded control-vs-hybrid pilot compared the committed prototype against the
+original stock selector while holding `enable_fused_mc2=1` in both arms. Both
+arms therefore used the same NZ weights; only
+`moe_phase_hybrid_policy=off|mixed_prefill_fused` changed. Each arm used one
+fresh server followed by three paired seeds, with 24 measured requests plus 4
+warmups per seed at 462 input / 16 output tokens and QPS 4. All six measured
+trials completed 24/24 with no request errors.
+
+| metric (median over 3 seeds) | stock selector | mixed-only hybrid | delta |
+|---|---:|---:|---:|
+| request throughput | 3.71 req/s | 3.69 req/s | -0.7% |
+| median TTFT | 180.7 ms | 248.6 ms | +37.5% |
+| p99 TTFT | 283.5 ms | 497.0 ms | +75.3% |
+| median TPOT | 30.6 ms | 43.7 ms | +43.0% |
+| mean TPOT | 34.6 ms | 50.3 ms | +45.6% |
+| median ITL | 19.5 ms | 20.9 ms | +7.3% |
+
+All three paired seeds show the same direction. The hybrid log records 704
+`PURE_DECODE -> ALLGATHER`, 26 `PURE_PREFILL -> ALLGATHER`, and 122
+`MIXED -> FUSED_MC2` debug selections; the stock arm selected FUSED_MC2 under
+its existing policy. These debug counts are selector invocations across both
+ranks, not a direct time decomposition.
+
+**Go/no-go:** do not enable this policy by default for the tested traffic. It
+proves that the requested phase split is mechanically possible, but it does
+not preserve latency at this workload. The pilot does not isolate a single
+cause: the hybrid changes both the decode communication family and the
+compiled/eager boundary for PURE_PREFILL/MIXED. In particular, attributing the
+regression to the fused MIXED kernel alone would overstate the evidence. A
+future attempt would need phase-aware compiled artifacts (or another safe way
+to retain compilation) and a workload deliberately rich in naturally
+co-scheduled MIXED waves before more campaign investment is justified. Raw
+local receipts are under
+`.lumi-workbench/artifacts/moe-phase-hybrid-pilot-20260808/`.
+
 ## Residual risks and next experiments
 
-- No performance claim yet: the bounded NPU gate proves the phase split and
-  correctness, but the policy still needs a fresh, same-NZ control-vs-hybrid
-  comparison before deciding whether the mixed-only route is profitable.
+- The same-NZ pilot is negative at 462->16 / QPS 4: throughput is flat and
+  latency regresses. Keep the policy experimental and default-off; do not
+  merge or promote it as an optimization without a new mechanism that avoids
+  the eager-boundary cost and fresh evidence on mixed-rich traffic.
 - Decode layout disclosure: the 2x910B2 discriminator found NZ stock decode
   3.82--16.68% faster than ND across capacities 2--32. Historical ND parity is
   disproven; use a fresh control and name the hybrid arm "baseline comm on NZ
