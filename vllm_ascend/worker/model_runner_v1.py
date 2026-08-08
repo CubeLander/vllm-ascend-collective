@@ -168,7 +168,11 @@ from vllm_ascend.worker.utils import AscendKVBlockZeroer
 
 from vllm_ascend.ascend_forward_context import (  # isort: skip
     MoECommType,
+    MoEForwardPhase,
+    classify_forward_phase,
     get_mc2_tokens_capacity,
+    is_moe_phase_hybrid_active,
+    should_bypass_compiled_for_moe_phase_hybrid,
     select_moe_comm_method,
     set_ascend_forward_context,
     set_mc2_mask,
@@ -2150,6 +2154,20 @@ class NPUModelRunner(GPUModelRunner):
                     num_scheduled_tokens_np,
                 )
 
+                # Host-side forward phase for the phase-keyed hybrid MoE
+                # policy. Derived from CPU scheduler state (attn_state /
+                # with_prefill); never from a device tensor .item() sync.
+                moe_forward_phase = classify_forward_phase(self.attn_state, self.with_prefill)
+                # Under the policy, PURE_PREFILL and MIXED both bypass the
+                # compiled model (skip_compiled=True + eager NONE below):
+                # only MIXED runs fused, but a pure-prefill baseline can
+                # differ from the decode baseline (A3: MC2 vs ALLTOALL) and
+                # must never reuse a decode-compiled artifact. PURE_DECODE
+                # keeps the stock dispatch and compiled graphs.
+                moe_phase_hybrid_eager = should_bypass_compiled_for_moe_phase_hybrid(
+                    moe_forward_phase, self.vllm_config
+                )
+
                 num_tokens_unpadded = scheduler_output.total_num_scheduled_tokens
                 if self.pcp_size > 1:
                     num_tokens_unpadded = self.pcp_manager.total_num_sampled_tokens_pcp
@@ -2175,7 +2193,12 @@ class NPUModelRunner(GPUModelRunner):
                     num_scheduled_tokens_np=num_scheduled_tokens_np,
                     max_num_scheduled_tokens=max_num_scheduled_tokens,
                     use_cascade_attn=cascade_attn_prefix_lens is not None,
-                    force_eager=self.model_config.enforce_eager,
+                    # Phase-keyed hybrid: PURE_PREFILL and MIXED forwards run
+                    # eager (skip_compiled=True + cudagraph NONE), so neither
+                    # the fused comm path nor a phase-specific baseline comm
+                    # path is ever captured into, or replayed from, a stock
+                    # compiled/ACL template. Decode keeps stock graphs.
+                    force_eager=self.model_config.enforce_eager or moe_phase_hybrid_eager,
                     num_encoder_reqs=len(scheduler_output.scheduled_encoder_inputs),
                 )
 
@@ -2358,6 +2381,7 @@ class NPUModelRunner(GPUModelRunner):
                 has_sinks=self._has_sinks,
                 input_ids=input_ids,
                 eplb_heat_collection_status=self.eplb_heat_collection_status if self.dynamic_eplb else False,
+                forward_phase=moe_forward_phase,
             ),
             self.maybe_get_kv_connector_output(
                 scheduler_output,
@@ -3423,6 +3447,7 @@ class NPUModelRunner(GPUModelRunner):
         num_active_loras: int = 0,
         profile_seq_lens: int | None = None,
         profile_cpp: bool = False,
+        moe_forward_phase: MoEForwardPhase | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         # only support eager mode and piecewise graph now
         assert cudagraph_runtime_mode is None or cudagraph_runtime_mode.valid_runtime_modes()
@@ -3667,6 +3692,15 @@ class NPUModelRunner(GPUModelRunner):
                 has_sinks = self._has_sinks,
                 input_ids=input_ids,
                 eplb_heat_collection_status=self.eplb_heat_collection_status if self.dynamic_eplb else False,
+                # Dummy runs carry the same host phase classification as the
+                # runtime forward so capture-time selection matches replay.
+                forward_phase=(
+                    moe_forward_phase
+                    if moe_forward_phase is not None
+                    else MoEForwardPhase.PURE_PREFILL
+                    if with_prefill
+                    else MoEForwardPhase.PURE_DECODE
+                ),
             ):
                 outputs = self._model_forward(
                     num_tokens_padded, input_ids, positions, intermediate_tensors, inputs_embeds
@@ -3724,7 +3758,22 @@ class NPUModelRunner(GPUModelRunner):
         if self.max_num_tokens > mc2_tokens_capacity and select_moe_comm_method(
             mc2_tokens_capacity, self.vllm_config
         ) in {MoECommType.MC2, MoECommType.FUSED_MC2}:
-            self._dummy_run(mc2_tokens_capacity, with_prefill=True, is_profile=True)
+            # Under the phase hybrid, explicitly warm/profile the fused MIXED
+            # path. Otherwise the first real mixed wave would be the first
+            # dispatch_ffn_combine invocation and its workspace would be
+            # absent from memory profiling. The default-off path keeps the
+            # historical PURE_PREFILL dummy unchanged.
+            profile_moe_phase = (
+                MoEForwardPhase.MIXED
+                if is_moe_phase_hybrid_active(MoEForwardPhase.MIXED, self.vllm_config)
+                else MoEForwardPhase.PURE_PREFILL
+            )
+            self._dummy_run(
+                mc2_tokens_capacity,
+                with_prefill=True,
+                moe_forward_phase=profile_moe_phase,
+                is_profile=True,
+            )
         origin_max_num_tokens = self.max_num_tokens
         # in the pcp scenario, the split sequence needs to be used for profile run
         # TODO: after the vllm pcp function is launched, this logic needs to be brought up to the community

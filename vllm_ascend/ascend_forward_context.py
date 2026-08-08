@@ -10,7 +10,7 @@ from vllm.distributed import get_dp_group, get_ep_group, get_tensor_model_parall
 from vllm.forward_context import BatchDescriptor, get_forward_context, set_forward_context
 from vllm.logger import logger
 
-from vllm_ascend.ascend_config import get_ascend_config
+from vllm_ascend.ascend_config import MoEPhaseHybridPolicy, get_ascend_config, parse_moe_phase_hybrid_policy
 from vllm_ascend.utils import (
     AscendDeviceType,
     enable_sp,
@@ -32,6 +32,160 @@ class MoECommType(Enum):
 
 MAX_A2_FUSED_MC2_EP_SIZE = 8
 MIN_A2_FUSED_MC2_LOCAL_EXPERTS = 3
+
+
+class MoEForwardPhase(Enum):
+    """Host-computed forward phase used by the phase-keyed hybrid MoE policy.
+
+    The classification is derived from host-side scheduler state
+    (``attn_state``/``with_prefill`` in the v1 runner). It never synchronizes
+    a device tensor with ``.item()``.
+
+    - ``PURE_DECODE``: every request is decoding (or speculative decode).
+    - ``PURE_PREFILL``: every request is a brand-new prefill
+      (``PrefillNoCache``: zero computed tokens).
+    - ``MIXED``: at least one request is prefilling while others may already
+      have computed tokens (``ChunkedPrefill`` / ``PrefillCacheHit``).
+    """
+
+    PURE_DECODE = 0
+    PURE_PREFILL = 1
+    MIXED = 2
+
+
+def get_moe_phase_hybrid_policy(vllm_config: VllmConfig | None = None) -> MoEPhaseHybridPolicy:
+    """Resolve the phase-keyed hybrid MoE policy (additional_config only).
+
+    The authoritative value is ``additional_config.moe_phase_hybrid_policy``
+    (see :func:`vllm_ascend.ascend_config.parse_moe_phase_hybrid_policy`);
+    there is deliberately no environment-variable fallback. ``AscendConfig``
+    validates the same value at startup, so a typo fails closed during
+    initialization. ``vllm_config=None`` (legacy callers) falls back to the
+    initialized ``AscendConfig`` singleton.
+    """
+    if vllm_config is not None:
+        additional_config = getattr(vllm_config, "additional_config", None) or {}
+        return parse_moe_phase_hybrid_policy(additional_config.get("moe_phase_hybrid_policy", "off"))
+    return get_ascend_config().moe_phase_hybrid_policy
+
+
+def classify_forward_phase(attn_state: Any, with_prefill: bool) -> MoEForwardPhase:
+    """Classify the host forward phase from the runner's host-side signals.
+
+    The runner computes ``attn_state`` (``AscendAttentionState``) and
+    ``with_prefill`` from CPU scheduler buffers; no device tensor sync is
+    performed here.
+    """
+    if not with_prefill:
+        return MoEForwardPhase.PURE_DECODE
+    # Lazy import avoids a cycle: attention_v1 already imports this module.
+    from vllm_ascend.attention.attention_v1 import AscendAttentionState
+
+    if attn_state == AscendAttentionState.PrefillNoCache:
+        return MoEForwardPhase.PURE_PREFILL
+    return MoEForwardPhase.MIXED
+
+
+def is_moe_phase_hybrid_active(
+    forward_phase: MoEForwardPhase | None,
+    vllm_config: VllmConfig,
+    is_draft_model: bool = False,
+) -> bool:
+    """Whether the current forward runs under the fused mixed-prefill path.
+
+    True only when the policy is enabled, the forward is the main (non-draft)
+    MoE model, and the phase is exactly ``MIXED``. Only MIXED selects
+    ``FUSED_MC2`` and bypasses the compiled model; ``PURE_PREFILL`` and
+    ``PURE_DECODE`` keep the baseline comm family, so they are never
+    'hybrid active'.
+    """
+    return (
+        get_moe_phase_hybrid_policy(vllm_config) == MoEPhaseHybridPolicy.MIXED_PREFILL_FUSED
+        and not is_draft_model
+        and forward_phase is MoEForwardPhase.MIXED
+        and is_moe_model(vllm_config)
+    )
+
+
+def should_bypass_compiled_for_moe_phase_hybrid(
+    forward_phase: MoEForwardPhase | None,
+    vllm_config: VllmConfig,
+    is_draft_model: bool = False,
+) -> bool:
+    """Whether the forward must bypass the compiled model under the policy.
+
+    With the policy enabled, BOTH ``PURE_PREFILL`` and ``MIXED`` force
+    ``skip_compiled=True`` and eager dispatch (cudagraph NONE), so decode is
+    the only compiled/ACL-graph path. This is required even for
+    ``PURE_PREFILL`` (which selects the baseline comm family, not fused):
+    on A3 the decode baseline can be MC2 while a large pure-prefill baseline
+    is ALLTOALL, so a pure-prefill wave must never reuse the decode-compiled
+    MC2 artifact. ``PURE_DECODE`` keeps the stock compiled/captured path.
+    """
+    return (
+        get_moe_phase_hybrid_policy(vllm_config) == MoEPhaseHybridPolicy.MIXED_PREFILL_FUSED
+        and not is_draft_model
+        and forward_phase in (MoEForwardPhase.PURE_PREFILL, MoEForwardPhase.MIXED)
+        and is_moe_model(vllm_config)
+    )
+
+
+def validate_moe_phase_hybrid_policy(vllm_config: VllmConfig) -> None:
+    """Fail closed when the phase-keyed hybrid policy cannot be safe.
+
+    - Data parallel: DP ranks can schedule different phases (decode vs
+      prefill) for the same step, but the fused MC2 collectives span the EP
+      group which includes every DP rank. A per-rank phase-dependent comm
+      choice would deadlock or corrupt shapes, so DP > 1 raises at startup.
+    - V2 runner: the upstream V2 runner computes ``skip_compiled`` itself;
+      vllm-ascend cannot force the fused prefill path to bypass the compiled
+      model from the platform hook. Without that bypass the historical
+      stale-layout failure is reproducible, so V2 raises at startup.
+    - Cudagraph envelope: only ``FULL_DECODE_ONLY`` dispatches prefill/mixed
+      waves to NONE structurally, so pure decode is the only graph path.
+      FULL / FULL_AND_PIECEWISE / PIECEWISE can dispatch prefill into a
+      template and are rejected; ``NONE`` (no decode graphs) is rejected
+      because the policy's invariant requires decode graphs to exist.
+    """
+    if get_moe_phase_hybrid_policy(vllm_config) == MoEPhaseHybridPolicy.OFF:
+        return
+    # The fused impl and the NZ weight layout are only initialized when
+    # enable_fused_mc2 == 1; without it the policy silently falls back to the
+    # baseline family and the experiment is not actually enabled.
+    if get_ascend_config().enable_fused_mc2 != 1:
+        raise ValueError(
+            "additional_config.moe_phase_hybrid_policy=mixed_prefill_fused "
+            "requires additional_config.enable_fused_mc2 == 1: the fused "
+            "comm impl and the NZ weight layout are only initialized in that "
+            "mode. Without it the policy silently selects the baseline "
+            "family and the experiment is not enabled."
+        )
+    if vllm_config.parallel_config.data_parallel_size > 1:
+        raise ValueError(
+            "additional_config.moe_phase_hybrid_policy=mixed_prefill_fused "
+            "requires data_parallel_size == 1: DP ranks can schedule "
+            "different phases for the same step, and FUSED_MC2 collectives "
+            "span all DP ranks, so a per-rank phase-dependent comm choice is "
+            "not DP-consistent."
+        )
+    if vllm_config.use_v2_model_runner:
+        raise ValueError(
+            "additional_config.moe_phase_hybrid_policy=mixed_prefill_fused "
+            "is not supported on the V2 model runner: the upstream runner "
+            "owns skip_compiled, so vllm-ascend cannot force fused prefill "
+            "forwards to bypass the compiled model, which would recreate the "
+            "stale-layout failure."
+        )
+    cudagraph_mode = vllm_config.compilation_config.cudagraph_mode
+    if cudagraph_mode != CUDAGraphMode.FULL_DECODE_ONLY:
+        raise ValueError(
+            "additional_config.moe_phase_hybrid_policy=mixed_prefill_fused "
+            f"requires cudagraph_mode == FULL_DECODE_ONLY, got {cudagraph_mode}. "
+            "FULL / FULL_AND_PIECEWISE / PIECEWISE can dispatch prefill or "
+            "mixed waves into a graph template, which would either replay a "
+            "stock template under a fused intent or require unsafe runtime "
+            "capture; skip_compiled alone does not protect that envelope."
+        )
 
 
 _mrv2_in_profile_run: bool = False
@@ -78,11 +232,21 @@ def set_ascend_forward_context(
     has_sinks=False,
     input_ids=None,
     eplb_heat_collection_status: bool = False,
+    forward_phase: MoEForwardPhase | None = None,
 ):
     """A context manager that stores the current forward context,
     can be attention metadata, etc.
     We add some additional param into forward_context.
     """
+    # Phase-keyed hybrid MoE policy (experimental, default OFF). Only MIXED
+    # selects the fused comm path; PURE_PREFILL keeps the baseline comm
+    # family. Both bypass the compiled model (skip_compiled=True) so one
+    # torch.compile/ACL template never embeds two different comm objects and
+    # decode is the only compiled path. PURE_DECODE keeps the stock
+    # compiled/captured decode path untouched.
+    if should_bypass_compiled_for_moe_phase_hybrid(forward_phase, vllm_config, is_draft_model):
+        validate_moe_phase_hybrid_policy(vllm_config)
+        skip_compiled = True
     forward_context_kwargs = {
         "attn_metadata": attn_metadata,
         "vllm_config": vllm_config,
@@ -101,7 +265,7 @@ def set_ascend_forward_context(
         from vllm_ascend.ops.fused_moe.moe_comm_method import get_moe_comm_method
 
         max_num_tokens = int(num_tokens_across_dp.max().item()) if num_tokens_across_dp is not None else num_tokens
-        moe_comm_type = select_moe_comm_method(max_num_tokens, vllm_config, is_draft_model)
+        moe_comm_type = select_moe_comm_method(max_num_tokens, vllm_config, is_draft_model, phase=forward_phase)
 
         forward_context.moe_comm_type = moe_comm_type
         forward_context.moe_comm_method = get_moe_comm_method(moe_comm_type)
@@ -243,9 +407,190 @@ def get_mc2_mask():
     return _reserved_mc2_mask
 
 
-def select_moe_comm_method(num_tokens: int, vllm_config: VllmConfig, is_draft_model=False) -> MoECommType | None:
-    """Select the MoE communication method according to parallel settings,
-    device generation, token count, and quantization.
+def _moe_phase_hybrid_prefill_fused_available(vllm_config: VllmConfig) -> bool:
+    """SoC capability gate for the fused prefill path of the hybrid policy.
+
+    Reuses exactly the same conditions the stock selector applies for the
+    FUSED_MC2 / dispatch_ffn_combine BF16 path. Deliberately token-count
+    independent: per-wave token thresholds are what historically swapped the
+    Python comm object inside one compiled template.
+    """
+    if not is_moe_model(vllm_config):
+        return False
+    if not vllm_config.parallel_config.enable_expert_parallel or get_ep_group().world_size == 1:
+        return False
+    soc_version = get_ascend_device_type()
+    ascend_config = get_ascend_config()
+    if soc_version in {AscendDeviceType.A3}:
+        # dispatch_ffn_combine (BF16) is supported up to EP size 32.
+        return ascend_config.enable_fused_mc2 == 1 and get_ep_group().world_size <= 32
+    if soc_version in {AscendDeviceType.A2}:
+        num_experts = vllm_config.model_config.get_num_experts()
+        ep_world_size = (
+            vllm_config.parallel_config.world_size_across_dp // vllm_config.parallel_config.pipeline_parallel_size
+        )
+        num_experts_per_device = num_experts // ep_world_size
+        quant_type = getattr(
+            vllm_config.model_config.hf_text_config,
+            "moe_quantize",
+            getattr(vllm_config.model_config.hf_text_config, "quantize", None),
+        )
+        return (
+            ascend_config.enable_fused_mc2 == 1
+            and quant_type in (None, "w8a8_dynamic")
+            and get_ep_group().world_size <= MAX_A2_FUSED_MC2_EP_SIZE
+            and num_experts_per_device >= MIN_A2_FUSED_MC2_LOCAL_EXPERTS
+        )
+    return False
+
+
+def select_moe_comm_method(
+    num_tokens: int,
+    vllm_config: VllmConfig,
+    is_draft_model: bool = False,
+    *,
+    phase: MoEForwardPhase | None = None,
+) -> MoECommType | None:
+    """Select the MoE communication method, optionally phase-keyed.
+
+    With the hybrid policy OFF (default), or with ``phase=None`` (legacy
+    callers such as the spec-decode proposers), this returns exactly the
+    stock selector result.
+
+    With ``MoEPhaseHybridPolicy.MIXED_PREFILL_FUSED``:
+
+    - ``MIXED`` selects ``MoECommType.FUSED_MC2`` when the SoC capability
+      gate holds, otherwise it fails closed to the baseline family.
+    - ``PURE_DECODE`` and ``PURE_PREFILL`` select the baseline family -- the
+      stock selector with ``enable_fused_mc2 == 0`` -- so the compiled/ACL
+      decode path keeps the exact comm object it captured with (never the
+      fused path the stock selector would pick under ``enable_fused_mc2=1``),
+      and pure prefill introduces no second comm object into any template.
+    """
+    if get_moe_phase_hybrid_policy(vllm_config) == MoEPhaseHybridPolicy.OFF or phase is None or is_draft_model:
+        return _select_moe_comm_method_stock(num_tokens, vllm_config, is_draft_model)
+    if phase == MoEForwardPhase.MIXED and _moe_phase_hybrid_prefill_fused_available(vllm_config):
+        logger.debug(
+            "MoE phase-keyed hybrid: phase=%s selects %s",
+            phase,
+            MoECommType.FUSED_MC2,
+        )
+        return MoECommType.FUSED_MC2
+    baseline_type = _select_moe_comm_method_baseline(num_tokens, vllm_config, is_draft_model)
+    if phase == MoEForwardPhase.MIXED:
+        logger.debug(
+            "MoE phase-keyed hybrid: fused mixed-prefill unavailable (phase=%s), failing closed to baseline %s",
+            phase,
+            baseline_type,
+        )
+    else:
+        logger.debug(
+            "MoE phase-keyed hybrid: phase=%s selects baseline %s",
+            phase,
+            baseline_type,
+        )
+    return baseline_type
+
+
+def _select_moe_comm_method_baseline(
+    num_tokens: int, vllm_config: VllmConfig, is_draft_model: bool = False
+) -> MoECommType | None:
+    """Baseline MoE communication family: the stock selector with ``enable_fused_mc2 == 0``.
+
+    This is the explicit, auditable version of "what the stock selector
+    would choose if fused MC2 were disabled". The phase-keyed hybrid policy
+    uses it for every non-``MIXED`` phase, so under the policy the decode
+    comm object is the baseline family (ALLGATHER on the A2/TP2 experiment,
+    MC2 or ALLTOALL on A3), never the fused path the stock selector would
+    pick with ``enable_fused_mc2=1``. It is written out explicitly rather
+    than simulated by temporarily mutating the global config, so the choice
+    is deterministic and unit-testable.
+
+    Rules are identical to :func:`_select_moe_comm_method_stock` with the
+    fused-MC2 branches removed:
+
+    1. Non-MoE models return `None`.
+    2. Without expert parallel (or EP==1), fall back to all-gather.
+    3. On A2 with expert parallel, pick MC2 when tokens fit the MC2 capacity
+       and the EP group is large enough, else all-gather (the fused-A2 branch
+       never applies).
+    4. On A3 with expert parallel, use MC2 within capacity, else all-to-all
+       (no fused branch).
+    5. On 310P, always use all-gather.
+    6. On A5 with expert parallel, identical to stock: MC2 when tokens fit
+       the MC2 capacity and the world size is large enough; otherwise
+       all-gather when EP is smaller than num of topK experts, else
+       all-to-all.
+
+    Args:
+        num_tokens (int): The number of tokens in the current batch.
+        vllm_config (VllmConfig): Runtime configuration for the model.
+        is_draft_model (bool): Whether the model runs in MTP mode.
+
+    Raises:
+        ValueError: If the soc version is unsupported.
+
+    Returns:
+        MoECommType | None: The selected baseline communication method.
+    """
+    if not is_moe_model(vllm_config):
+        return None
+    mc2_tokens_capacity = get_mc2_tokens_capacity()
+    soc_version = get_ascend_device_type()
+
+    if not vllm_config.parallel_config.enable_expert_parallel or get_ep_group().world_size == 1:
+        moe_comm_type = MoECommType.ALLGATHER
+    elif soc_version in {AscendDeviceType.A2}:
+        num_experts = vllm_config.model_config.get_num_experts()
+        ep_world_size = (
+            vllm_config.parallel_config.world_size_across_dp // vllm_config.parallel_config.pipeline_parallel_size
+        )
+        num_experts_per_device = num_experts // ep_world_size
+        if num_experts_per_device <= 24 and ep_world_size >= 16 and num_tokens <= mc2_tokens_capacity:
+            moe_comm_type = MoECommType.MC2
+        else:
+            moe_comm_type = MoECommType.ALLGATHER
+    elif soc_version in {AscendDeviceType.A3}:
+        # enable_fused_mc2 == 0: the fused branch never applies; the MC2
+        # capacity alone decides MC2 vs ALLTOALL.
+        if num_tokens <= mc2_tokens_capacity:
+            moe_comm_type = MoECommType.MC2
+        else:
+            moe_comm_type = MoECommType.ALLTOALL
+    elif soc_version in {AscendDeviceType._310P}:
+        moe_comm_type = MoECommType.ALLGATHER
+    elif soc_version in {AscendDeviceType.A5}:
+        num_experts_per_tok = getattr(
+            vllm_config.model_config.hf_text_config,
+            "num_experts_per_tok",
+            getattr(vllm_config.model_config.hf_text_config, "top_k_experts", 1),
+        )
+        world_size = vllm_config.parallel_config.world_size_across_dp
+        if num_tokens <= mc2_tokens_capacity and world_size > 1:
+            moe_comm_type = MoECommType.MC2
+        elif world_size <= num_experts_per_tok:
+            moe_comm_type = MoECommType.ALLGATHER
+        else:
+            moe_comm_type = MoECommType.ALLTOALL
+    else:
+        raise ValueError(f"Unsupported soc_version: {soc_version}")
+    logger.debug(
+        "MoE baseline comm method selected: soc=%s, method=%s, num_tokens=%d, mc2_capacity=%s",
+        soc_version,
+        moe_comm_type,
+        num_tokens,
+        mc2_tokens_capacity,
+    )
+    return moe_comm_type
+
+
+def _select_moe_comm_method_stock(num_tokens: int, vllm_config: VllmConfig, is_draft_model=False) -> MoECommType | None:
+    """Stock MoE communication method selection.
+
+    This is the historical, phase-agnostic selector. It is kept byte-for-byte
+    intact and is the only behavior visible when the phase-keyed hybrid policy
+    is OFF. Selection considers parallel settings, device generation, token
+    count, and quantization.
 
     1. Non-MoE models return `None`.
     2. Without expert parallel, fall back to all-gather.

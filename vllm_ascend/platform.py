@@ -774,6 +774,14 @@ class NPUPlatform(Platform):
             compilation_config.mode = CompilationMode.NONE
             ascend_config.ascend_compilation_config.enable_npugraph_ex = False
 
+        # Phase-keyed hybrid MoE policy: fail closed at startup unless the
+        # execution envelope is exactly v1 + FULL_DECODE_ONLY + DP==1.
+        # Runs after mode resolution so platform fallbacks (e.g. eager) are
+        # the authority, not the user-supplied mode string.
+        from vllm_ascend.ascend_forward_context import validate_moe_phase_hybrid_policy
+
+        validate_moe_phase_hybrid_policy(vllm_config)
+
         # Sync enable_npugraph_ex back to vllm_config.additional_config so that
         # spawned worker processes see the correct value.
         _sync_npugraph_ex_to_additional_config(vllm_config, ascend_config)
@@ -1086,6 +1094,13 @@ class NPUPlatform(Platform):
         # is_draft_model.
         if not vllm_config.use_v2_model_runner:
             return {}
+
+        # Phase-keyed hybrid policy is not supported on the V2 runner (it owns
+        # skip_compiled upstream); fail closed instead of silently selecting a
+        # fused comm object inside a compiled template.
+        from vllm_ascend.ascend_forward_context import validate_moe_phase_hybrid_policy
+
+        validate_moe_phase_hybrid_policy(vllm_config)
 
         # is_draft_model will be removed later, so we set it to False temporarily.
         is_draft_model = False

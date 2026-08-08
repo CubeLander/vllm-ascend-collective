@@ -21,7 +21,12 @@ from unittest.mock import patch
 from vllm.config import KVTransferConfig, VllmConfig
 
 from tests.ut.base import TestBase
-from vllm_ascend.ascend_config import clear_ascend_config, get_ascend_config, init_ascend_config
+from vllm_ascend.ascend_config import (
+    MoEPhaseHybridPolicy,
+    clear_ascend_config,
+    get_ascend_config,
+    init_ascend_config,
+)
 from vllm_ascend.utils import clear_enable_sp, enable_sp, get_flashcomm2_config_and_validate
 
 
@@ -420,3 +425,37 @@ class TestAscendConfig(TestBase):
         second_ascend_config = init_ascend_config(second_vllm_config)
         self.assertIsNot(first_ascend_config, second_ascend_config)
         self.assertTrue(second_ascend_config.ascend_compilation_config.enable_npugraph_ex)
+
+    @_clean_up_ascend_config
+    @patch("vllm_ascend.platform.NPUPlatform.check_and_update_config")
+    def test_init_ascend_config_moe_phase_hybrid_policy_default_off(self, mock_fix_incompatible_config):
+        """The phase-keyed hybrid MoE policy defaults to OFF (no additional_config)."""
+        test_vllm_config = VllmConfig()
+        ascend_config = init_ascend_config(test_vllm_config)
+        self.assertIs(ascend_config.moe_phase_hybrid_policy, MoEPhaseHybridPolicy.OFF)
+        self.assertIs(get_ascend_config().moe_phase_hybrid_policy, MoEPhaseHybridPolicy.OFF)
+
+    @_clean_up_ascend_config
+    @patch("vllm_ascend.platform.NPUPlatform.check_and_update_config")
+    def test_init_ascend_config_moe_phase_hybrid_policy_mixed(self, mock_fix_incompatible_config):
+        """additional_config.moe_phase_hybrid_policy=mixed_prefill_fused is honored."""
+        test_vllm_config = VllmConfig()
+        test_vllm_config.additional_config = {"moe_phase_hybrid_policy": "mixed_prefill_fused"}
+        ascend_config = init_ascend_config(test_vllm_config)
+        self.assertIs(ascend_config.moe_phase_hybrid_policy, MoEPhaseHybridPolicy.MIXED_PREFILL_FUSED)
+        self.assertIs(get_ascend_config().moe_phase_hybrid_policy, MoEPhaseHybridPolicy.MIXED_PREFILL_FUSED)
+
+    @_clean_up_ascend_config
+    @patch("vllm_ascend.platform.NPUPlatform.check_and_update_config")
+    def test_init_ascend_config_moe_phase_hybrid_policy_invalid_raises(self, mock_fix_incompatible_config):
+        """An unrecognized policy value fails closed at config construction.
+
+        The policy is an explicit enum/string: bool-like aliases
+        (0/1/true/false/on/none/...) are deliberately rejected so the switch
+        cannot be set ambiguously.
+        """
+        for value in ["", "prefill_fused", "0", "1", "true", "false", "on", "none", "enabled", "2"]:
+            test_vllm_config = VllmConfig()
+            test_vllm_config.additional_config = {"moe_phase_hybrid_policy": value}
+            with self.subTest(value=value), self.assertRaisesRegex(ValueError, "moe_phase_hybrid_policy"):
+                init_ascend_config(test_vllm_config)

@@ -15,6 +15,7 @@
 # limitations under the License.
 import json
 import os
+from enum import Enum
 from typing import TYPE_CHECKING, Any
 
 from vllm.logger import logger
@@ -22,6 +23,52 @@ from vllm.utils.math_utils import cdiv
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
+
+
+class MoEPhaseHybridPolicy(Enum):
+    """Phase-keyed hybrid MoE comm policy (experimental, default OFF).
+
+    ``OFF`` keeps the stock selector byte-for-byte: forward phase is ignored
+    and no graph/dispatch behavior changes.
+
+    ``MIXED_PREFILL_FUSED`` is the single supported experimental value: only
+    the ``MIXED`` forward phase (at least one request prefilling alongside
+    requests that already have computed tokens) may select
+    ``MoECommType.FUSED_MC2`` and bypass the compiled model
+    (``skip_compiled=True`` + eager dispatch). ``PURE_DECODE`` and
+    ``PURE_PREFILL`` both keep the baseline comm family (the stock selector
+    with ``enable_fused_mc2 == 0``), so the compiled/ACL-graph decode path
+    never changes its comm object. See ``docs/moeffn-phase-keyed-hybrid.md``
+    for the full envelope and safety argument.
+    """
+
+    OFF = 0
+    MIXED_PREFILL_FUSED = 1
+
+
+def parse_moe_phase_hybrid_policy(raw: Any) -> MoEPhaseHybridPolicy:
+    """Parse an ``additional_config.moe_phase_hybrid_policy`` value.
+
+    Additional-config only: there is deliberately no environment-variable
+    fallback. Missing/``None`` selects ``OFF``. The accepted values are
+    exactly ``off`` and ``mixed_prefill_fused``; bool-like aliases
+    (``0``/``1``/``true``/``false``/``on``/...) are rejected so the switch
+    cannot be set ambiguously. Any other value raises, failing closed at
+    startup instead of silently keeping stock behavior that the user
+    believed they had enabled.
+    """
+    if raw is None:
+        return MoEPhaseHybridPolicy.OFF
+    value = str(raw).strip().lower()
+    if value == "off":
+        return MoEPhaseHybridPolicy.OFF
+    if value == "mixed_prefill_fused":
+        return MoEPhaseHybridPolicy.MIXED_PREFILL_FUSED
+    raise ValueError(
+        "Invalid additional_config.moe_phase_hybrid_policy value "
+        f"{raw!r}: expected exactly 'off' (default) or 'mixed_prefill_fused'; "
+        "bool-like aliases (0/1/true/false/on) are deliberately rejected"
+    )
 
 
 class AscendConfig:
@@ -222,6 +269,9 @@ class AscendConfig:
         self.enable_sleep_mode_extra_cleanup = additional_config.get("enable_sleep_mode_extra_cleanup", False)
         self.multistream_dsv4_dsa_overlap = additional_config.get("multistream_dsv4_dsa_overlap", True)
         self.enable_prefill_mc2 = bool(additional_config.get("enable_prefill_mc2", False))
+        self.moe_phase_hybrid_policy = parse_moe_phase_hybrid_policy(
+            additional_config.get("moe_phase_hybrid_policy", "off")
+        )
 
         self.enable_matmul_allreduce = self._get_config_value(
             additional_config,
