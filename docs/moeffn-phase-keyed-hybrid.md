@@ -360,6 +360,41 @@ compile transformations elsewhere in the graph. The canary's whole point is to
 measure the remaining discriminator without that confound. The raw comparison
 receipt is `.lumi-workbench/artifacts/nondecode-fused-462x256-crossed-20260808/`.
 
+## Opaque-MoE canary result
+
+The policy-local opaque boundary passed its 2x910B2 NPU canary. Each worker
+compiled exactly once; the retained FX graph contains 48
+`torch.ops.vllm.moe_forward.default` calls per rank and no raw
+`_moe_forward` body. Runtime safely alternated PURE_PREFILL/MIXED FUSED_MC2
+with PURE_DECODE baseline ALLGATHER, then captured/replayed decode ACL graphs,
+without a recompile, stale object, PrivateUse1 custom-op error, OOM, or 507015.
+The short correctness gate completed 4/4 exact 462/16 requests plus a
+deterministic post-MIXED completion. Receipt:
+`.lumi-workbench/artifacts/opaque-moe-npu-canary-20260808/`.
+
+The same historical 462/256/QPS4 crossed comparison was then repeated with
+the compile/raw confound removed. Both arms used the same compile settings;
+the corrected arm used compiled opaque baseline decode graphs plus fused
+non-decode, while the control kept stock compiled FUSED_MC2 decode. All four
+cells completed 32/32 with no errors, but the corrected arm remained slower
+in both orders:
+
+| metric | pair 1 | pair 2 |
+|---|---:|---:|
+| request throughput | -5.1% | -4.7% |
+| mean TPOT | +3.36 ms (+10.1%) | +2.46 ms (+7.3%) |
+| median TPOT | +3.54 ms | +2.75 ms |
+| median ITL | +2.96 ms | +3.13 ms |
+
+Therefore the compile boundary explained part, but not all, of the raw
+prototype's loss. With compilation preserved, replacing stock FUSED_MC2
+decode by baseline ALLGATHER still regresses the whole serving path. The
+earlier TraceLoom result was local: its matched 48-position fused neighborhood
+became slower, while whole-body direction was explicitly inconclusive. It did
+not establish that replacing the complete fused decode path would improve the
+graph. Receipt:
+`.lumi-workbench/artifacts/opaque-moe-462x256-crossed-20260808/`.
+
 ## Unit-test contract
 
 `tests/ut/test_ascend_forward_context.py`, `tests/ut/ops/test_moe_opaque_canary.py`
@@ -395,29 +430,20 @@ case.
 
 ## Residual risks and next experiments
 
-- The raw-baseline decode graph is **retired as a measured fallback**: it
-  loses 6--8% request throughput and about 13% mean TPOT in the crossed
-  462x256 comparison (see the retired section above). The current canary
-  measures the remaining discriminator — a **compiled baseline decode ACL
-  graph** (opaque `torch.ops.vllm.moe_forward` at op-runtime baseline
-  dispatch) alongside the compiled fused non-decode lane — without the raw
-  compile/raw confound.
-- The opaque-op path is the canary's core open risk: upstream keeps the
-  PrivateUse1/Ascend dispatch on the raw `_moe_forward` functions because
-  `torch.ops.vllm.moe_forward` custom ops have known dispatch compatibility
-  issues on NPU. This canary is exactly the probe for whether the opaque op
-  dispatches cleanly at runtime on Ascend. If it does not, the exact blocker
-  must be reported and the policy must not be promoted; selection in CPU
-  tests proves only registration/import, never NPU dispatch.
+- Both discriminators are negative: raw baseline decode loses 6--8% request
+  throughput, and compiled opaque baseline decode still loses 4.7--5.1% on
+  462x256. Keep `non_decode_fused` experimental/default-off; do not promote a
+  baseline-decode phase switch for this workload.
+- The opaque op itself is mechanism-correct on the tested A2/TP2 envelope and
+  removes the stale compiled-object limitation. It remains useful experimental
+  infrastructure, but it is not a performance win by itself and should not be
+  generalized until its wider NPU compatibility is separately justified.
 - Stale out-of-scope text: the `MoEPhaseHybridPolicy` enum docstring in
   `vllm_ascend/ascend_config.py`, the worker warmup comment in
   `vllm_ascend/worker/worker.py`, and the platform comment in
   `vllm_ascend/platform.py` still describe the retired raw-capture decode
   (`skip_compiled=True`); they were outside this canary's assigned file set
   and should be corrected when the design settles.
-- Decode layout disclosure: the hybrid decode arm is baseline comm on NZ
-  weights, not the historical ND stock decode. Compare against a fresh
-  control (same `enable_fused_mc2=1` arm with `moe_phase_hybrid_policy=off`).
 - Decode layout disclosure: the hybrid decode arm is baseline comm on NZ
   weights, not the historical ND stock decode. Compare against a fresh
   control (same `enable_fused_mc2=1` arm with `moe_phase_hybrid_policy=off`).
