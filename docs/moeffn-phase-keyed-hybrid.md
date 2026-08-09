@@ -9,10 +9,12 @@ mechanism/design note, not a performance promise.
 
 ## Motivation
 
-TraceLoom P2 (see `TRACELOOM_CUDA_HANDOFF_20260804.md`) observed that a fused
-MoE comm path can be a meaningful target inside decode ACL graphs
-(+12.36%/+12.95% on the decode-graph target) while graph-external large units
-show -11.48% and anchor count moves 1186 -> 994. These numbers are the
+TraceLoom P2 (see `TRACELOOM_CUDA_HANDOFF_20260804.md`) observed the structural
+replacement of the stock MoE path by `DispatchFFNCombineBF16` inside decode ACL
+graphs. Its historical selector statistic rose +12.36%/+12.95%, but that
+statistic compared a six-task stock compute motif with one larger fused task;
+it was not an equivalent-boundary graph-latency measurement. Graph-external
+large units moved -11.48% and anchor count moved 1186 -> 994. These numbers are
 prototype motivation only; no per-phase performance promise is made here.
 
 The production experiment
@@ -389,10 +391,12 @@ in both orders:
 Therefore the compile boundary explained part, but not all, of the raw
 prototype's loss. With compilation preserved, replacing stock FUSED_MC2
 decode by baseline ALLGATHER still regresses the whole serving path. The
-earlier TraceLoom result was local: its matched 48-position fused neighborhood
-became slower, while whole-body direction was explicitly inconclusive. It did
-not establish that replacing the complete fused decode path would improve the
-graph. Receipt:
+earlier TraceLoom result was local: its historical 48-position statistic rose,
+but the stock selector spanned six visible compute tasks whereas the fused
+selector spanned one larger `DispatchFFNCombineBF16` task. The corrected
+whole-body direction was explicitly inconclusive. It did not establish either
+that the fused kernel itself regressed or that replacing the complete fused
+decode path would improve the graph. Receipt:
 `.lumi-workbench/artifacts/opaque-moe-462x256-crossed-20260808/`.
 
 That comparison still changed the compiler boundary relative to the stock
