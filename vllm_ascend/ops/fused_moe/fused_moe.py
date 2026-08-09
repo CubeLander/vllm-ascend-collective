@@ -537,7 +537,10 @@ else:
             shares the one compiled outer artifact. Policy OFF keeps
             ``super()._select_forward()`` byte-for-byte.
             """
-            if _moe_phase_hybrid_policy_for_runner() is MoEPhaseHybridPolicy.NON_DECODE_FUSED:
+            if _moe_phase_hybrid_policy_for_runner() in (
+                MoEPhaseHybridPolicy.NON_DECODE_FUSED,
+                MoEPhaseHybridPolicy.OPAQUE_FUSED_CONTROL,
+            ):
                 global _opaque_moe_canary_logged
                 if not _opaque_moe_canary_logged:
                     logger.info(

@@ -101,7 +101,8 @@ def is_moe_phase_hybrid_active(
     :func:`select_moe_comm_method`) inside the FULL_DECODE_ONLY ACL graphs.
     """
     return (
-        get_moe_phase_hybrid_policy(vllm_config) == MoEPhaseHybridPolicy.NON_DECODE_FUSED
+        get_moe_phase_hybrid_policy(vllm_config)
+        in (MoEPhaseHybridPolicy.NON_DECODE_FUSED, MoEPhaseHybridPolicy.OPAQUE_FUSED_CONTROL)
         and not is_draft_model
         and forward_phase in (MoEForwardPhase.PURE_PREFILL, MoEForwardPhase.MIXED)
         and is_moe_model(vllm_config)
@@ -147,7 +148,8 @@ def should_force_eager_for_moe_phase_hybrid(
     family at op runtime).
     """
     return (
-        get_moe_phase_hybrid_policy(vllm_config) == MoEPhaseHybridPolicy.NON_DECODE_FUSED
+        get_moe_phase_hybrid_policy(vllm_config)
+        in (MoEPhaseHybridPolicy.NON_DECODE_FUSED, MoEPhaseHybridPolicy.OPAQUE_FUSED_CONTROL)
         and not is_draft_model
         and forward_phase in (MoEForwardPhase.PURE_PREFILL, MoEForwardPhase.MIXED)
         and is_moe_model(vllm_config)
@@ -564,8 +566,9 @@ def select_moe_comm_method(
       ``enable_fused_mc2=1``). The comm family is dispatched at opaque-op
       runtime inside the one compiled outer artifact; decode never retraces.
     """
+    policy = get_moe_phase_hybrid_policy(vllm_config)
     if (
-        get_moe_phase_hybrid_policy(vllm_config) == MoEPhaseHybridPolicy.OFF
+        policy == MoEPhaseHybridPolicy.OFF
         or phase is None
         or is_draft_model
         or not is_moe_model(vllm_config)
@@ -573,7 +576,10 @@ def select_moe_comm_method(
         # Non-MoE models return None (no comm family at all), so they never
         # enter the fail-fast non-decode branch.
         return _select_moe_comm_method_stock(num_tokens, vllm_config, is_draft_model)
-    if phase in (MoEForwardPhase.PURE_PREFILL, MoEForwardPhase.MIXED):
+    wants_fused = phase in (MoEForwardPhase.PURE_PREFILL, MoEForwardPhase.MIXED) or (
+        policy == MoEPhaseHybridPolicy.OPAQUE_FUSED_CONTROL and phase is MoEForwardPhase.PURE_DECODE
+    )
+    if wants_fused:
         if _moe_phase_hybrid_non_decode_fused_available(vllm_config):
             logger.debug(
                 "MoE phase-keyed hybrid: phase=%s selects %s",

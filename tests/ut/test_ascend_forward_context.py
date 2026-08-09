@@ -481,6 +481,18 @@ def test_select_moe_comm_method_hybrid_a2_tp2_experiment():
         assert _select_moe_comm_method_stock(32, vllm_config) is MoECommType.FUSED_MC2
 
 
+def test_select_moe_comm_method_opaque_fused_control_differs_only_on_decode():
+    """Measurement control keeps the opaque matrix but fuses decode too."""
+    hybrid = _with_hybrid_policy(_make_hybrid_moe_config(2, num_experts=16), "non_decode_fused")
+    control = _with_hybrid_policy(_make_hybrid_moe_config(2, num_experts=16), "opaque_fused_control")
+    with _patches(*_a2_selector_env(1, 2)):
+        assert select_moe_comm_method(32, hybrid, phase=MoEForwardPhase.PURE_DECODE) is MoECommType.ALLGATHER
+        assert select_moe_comm_method(32, control, phase=MoEForwardPhase.PURE_DECODE) is MoECommType.FUSED_MC2
+        for phase in (MoEForwardPhase.PURE_PREFILL, MoEForwardPhase.MIXED):
+            assert select_moe_comm_method(32, hybrid, phase=phase) is MoECommType.FUSED_MC2
+            assert select_moe_comm_method(32, control, phase=phase) is MoECommType.FUSED_MC2
+
+
 def test_select_moe_comm_method_hybrid_a2_fused_disabled_fail_fast():
     """A2 enable_fused_mc2=0: decode keeps the baseline ALLGATHER, but a
     non-decode phase must NEVER fall back to baseline -- the selector raises

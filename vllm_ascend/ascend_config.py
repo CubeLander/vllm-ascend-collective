@@ -56,6 +56,10 @@ class MoEPhaseHybridPolicy(Enum):
 
     OFF = 0
     NON_DECODE_FUSED = 1
+    # Measurement-only control: keep the same opaque compiler boundary and
+    # graph-dispatch matrix as NON_DECODE_FUSED, but use FUSED_MC2 for decode
+    # too. This isolates the decode comm-family effect.
+    OPAQUE_FUSED_CONTROL = 2
 
 
 def parse_moe_phase_hybrid_policy(raw: Any) -> MoEPhaseHybridPolicy:
@@ -79,9 +83,12 @@ def parse_moe_phase_hybrid_policy(raw: Any) -> MoEPhaseHybridPolicy:
         return MoEPhaseHybridPolicy.OFF
     if value == "non_decode_fused":
         return MoEPhaseHybridPolicy.NON_DECODE_FUSED
+    if value == "opaque_fused_control":
+        return MoEPhaseHybridPolicy.OPAQUE_FUSED_CONTROL
     raise ValueError(
         "Invalid additional_config.moe_phase_hybrid_policy value "
-        f"{raw!r}: expected exactly 'off' (default) or 'non_decode_fused'; "
+        f"{raw!r}: expected exactly 'off' (default), 'non_decode_fused', "
+        "or measurement-only 'opaque_fused_control'; "
         "bool-like aliases (0/1/true/false/on) and the retired "
         "'mixed_prefill_fused' spelling are deliberately rejected"
     )
