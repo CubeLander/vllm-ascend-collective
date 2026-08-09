@@ -395,6 +395,18 @@ not establish that replacing the complete fused decode path would improve the
 graph. Receipt:
 `.lumi-workbench/artifacts/opaque-moe-462x256-crossed-20260808/`.
 
+That comparison still changed the compiler boundary relative to the stock
+control. A final exact isolation therefore compared two opaque arms with the
+same code, weights, compile settings, graph dispatch, and fused nondecode lane:
+`opaque_fused_control` used FUSED_MC2 for PURE_DECODE, while
+`non_decode_fused` used ALLGATHER. In crossed order, FUSED minus baseline was
++0.8% / +5.0% request throughput and -0.2% / -7.2% mean TPOT (mean-of-pairs
++2.9% throughput, -1.9% TPOT). Pair magnitude varied, so the defensible verdict
+is **performance-neutral-to-positive for FUSED decode**, not a precise speedup.
+The decode-family switch alone does not reproduce the earlier 3 ms penalty;
+compiler opacity was the dominant confound in that comparison. Receipt:
+`.lumi-workbench/artifacts/opaque-exact-decode-control-20260808/`.
+
 ## Unit-test contract
 
 `tests/ut/test_ascend_forward_context.py`, `tests/ut/ops/test_moe_opaque_canary.py`
