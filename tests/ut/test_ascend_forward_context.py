@@ -180,3 +180,32 @@ def test_select_moe_comm_method_a2_fused_float(fused_mode, quant_type, ep_size, 
         patch("vllm_ascend.ascend_forward_context.get_ascend_config", return_value=ascend_config),
     ):
         assert select_moe_comm_method(32, vllm_config) is expected
+
+
+def test_select_moe_comm_method_a2_fused_float_over_capacity_falls_back():
+    """Fused float MC2 must fail closed above mc2_tokens_capacity.
+
+    Regression test for the A2 review: the fused selector previously ignored
+    mc2_tokens_capacity, so a fused MC2 kernel could be selected for token
+    counts every other MC2 path treats as out-of-capacity. Above capacity the
+    selector must fall back to the existing non-fused path (all-gather, since
+    plain MC2 is also gated by the same capacity), while the capacity
+    boundary itself keeps the fused path.
+    """
+    vllm_config = _make_moe_config(ep_size=2, num_experts=16)
+    ep_group = SimpleNamespace(world_size=2)
+    ascend_config = SimpleNamespace(enable_fused_mc2=1)
+
+    with (
+        patch("vllm_ascend.ascend_forward_context.is_moe_model", return_value=True),
+        patch("vllm_ascend.ascend_forward_context.get_mc2_tokens_capacity", return_value=64),
+        patch("vllm_ascend.ascend_forward_context.get_ascend_device_type", return_value=AscendDeviceType.A2),
+        patch("vllm_ascend.ascend_forward_context.get_ep_group", return_value=ep_group),
+        patch("vllm_ascend.ascend_forward_context.get_ascend_config", return_value=ascend_config),
+    ):
+        # Within capacity, including the boundary: fused path unchanged.
+        assert select_moe_comm_method(32, vllm_config) is MoECommType.FUSED_MC2
+        assert select_moe_comm_method(64, vllm_config) is MoECommType.FUSED_MC2
+        # Over capacity: fail closed to the non-fused all-gather path.
+        assert select_moe_comm_method(65, vllm_config) is MoECommType.ALLGATHER
+        assert select_moe_comm_method(128, vllm_config) is MoECommType.ALLGATHER

@@ -76,9 +76,13 @@ def _run_rank(rank: int, world_size: int, port: int) -> None:
         probs = probs.npu()
         weight1_nz = [torch_npu.npu_format_cast(weight1.npu(), 29)]
         weight2_nz = [torch_npu.npu_format_cast(weight2.npu(), 29)]
-        scale1 = [torch.empty(0, dtype=torch.int64)]
-        scale2 = [torch.empty(0, dtype=torch.int64)]
-        empty_bias = [torch.empty(0, dtype=torch.float32)]
+        # Keep the mandatory empty scale/bias placeholders on the same device
+        # as the NPU input/weights, matching the real call path (which keeps
+        # them on-device for torch.compile) instead of forcing implicit
+        # host-to-device transfers.
+        scale1 = [torch.empty(0, dtype=torch.int64).npu()]
+        scale2 = [torch.empty(0, dtype=torch.int64).npu()]
+        empty_bias = [torch.empty(0, dtype=torch.float32).npu()]
 
         out = torch.empty_like(x)
         expert_token_nums = torch.zeros(local_experts, dtype=torch.int32).npu()
