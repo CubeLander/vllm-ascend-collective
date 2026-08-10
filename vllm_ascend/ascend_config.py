@@ -15,6 +15,7 @@
 # limitations under the License.
 import json
 import os
+from enum import Enum
 from typing import TYPE_CHECKING, Any
 
 from vllm.logger import logger
@@ -22,6 +23,82 @@ from vllm.utils.math_utils import cdiv
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
+
+
+class MoEPhaseHybridPolicy(Enum):
+    """Phase-keyed hybrid MoE comm policy (experimental, default OFF).
+
+    ``OFF`` keeps the stock selector byte-for-byte: forward phase is ignored
+    and no graph/dispatch behavior changes.
+
+    ``NON_DECODE_FUSED`` is the primary experimental value. It makes two
+    independent, phase-keyed decisions on the v1 runner:
+
+    - ``PURE_DECODE`` selects the **baseline** comm family (the stock selector
+      with ``enable_fused_mc2 == 0``) at opaque-op runtime inside the one
+      compiled outer artifact, so the FULL_DECODE_ONLY ACL graphs capture and
+      replay raw baseline ops. ``force_eager`` stays ``False``.
+    - ``PURE_PREFILL`` and ``MIXED`` select ``MoECommType.FUSED_MC2`` and
+      force eager dispatch (``force_eager=True`` ->
+      ``CUDAGraphMode.NONE``), so they fall through the outer ACL graph
+      wrapper and run the single fused torch.compile/AOT artifact. When the
+      static SoC capability gate does not hold, startup/first-profile
+      selection **raises a deterministic ``ValueError``** (fail fast): a
+      non-decode wave never falls back to the token-dependent baseline comm
+      family inside the single fused lane, because swapping the comm object
+      per wave is exactly the stale-template failure this policy prevents.
+
+    ``OPAQUE_FUSED_CONTROL`` is a measurement-only control: it keeps the same
+    opaque compiler boundary and graph-dispatch matrix as
+    ``NON_DECODE_FUSED``, but routes **every** phase (decode included) to
+    ``FUSED_MC2`` so the decode comm-family effect can be isolated in an
+    ABBA measurement.
+
+    The two decisions never combine on one phase: decode is raw-baseline-in-
+    ACL-graphs, nondecode is fused-via-torch.compile-outside-ACL-graphs.
+    See ``docs/moeffn-phase-keyed-hybrid.md`` for the full envelope and
+    safety argument.
+    """
+
+    OFF = 0
+    NON_DECODE_FUSED = 1
+    # Measurement-only control: keep the same opaque compiler boundary and
+    # graph-dispatch matrix as NON_DECODE_FUSED, but use FUSED_MC2 for decode
+    # too. This isolates the decode comm-family effect.
+    OPAQUE_FUSED_CONTROL = 2
+
+
+def parse_moe_phase_hybrid_policy(raw: Any) -> MoEPhaseHybridPolicy:
+    """Parse an ``additional_config.moe_phase_hybrid_policy`` value.
+
+    Additional-config only: there is deliberately no environment-variable
+    fallback. Missing/``None`` selects ``OFF``. The accepted values are
+    exactly ``off``, ``non_decode_fused``, and the measurement-only
+    ``opaque_fused_control``; bool-like aliases
+    (``0``/``1``/``true``/``false``/``on``/...) are rejected so the switch
+    cannot be set ambiguously. The retired ``mixed_prefill_fused`` spelling of
+    the earlier, over-narrow pilot is deliberately rejected too: silently
+    mapping it onto the corrected semantics would change the graph behavior
+    the pilot actually ran with. Any other value raises, failing closed at
+    startup instead of silently keeping stock behavior that the user
+    believed they had enabled.
+    """
+    if raw is None:
+        return MoEPhaseHybridPolicy.OFF
+    value = str(raw).strip().lower()
+    if value == "off":
+        return MoEPhaseHybridPolicy.OFF
+    if value == "non_decode_fused":
+        return MoEPhaseHybridPolicy.NON_DECODE_FUSED
+    if value == "opaque_fused_control":
+        return MoEPhaseHybridPolicy.OPAQUE_FUSED_CONTROL
+    raise ValueError(
+        "Invalid additional_config.moe_phase_hybrid_policy value "
+        f"{raw!r}: expected exactly 'off' (default), 'non_decode_fused', "
+        "or measurement-only 'opaque_fused_control'; "
+        "bool-like aliases (0/1/true/false/on) and the retired "
+        "'mixed_prefill_fused' spelling are deliberately rejected"
+    )
 
 
 class AscendConfig:
@@ -222,6 +299,9 @@ class AscendConfig:
         self.enable_sleep_mode_extra_cleanup = additional_config.get("enable_sleep_mode_extra_cleanup", False)
         self.multistream_dsv4_dsa_overlap = additional_config.get("multistream_dsv4_dsa_overlap", True)
         self.enable_prefill_mc2 = bool(additional_config.get("enable_prefill_mc2", False))
+        self.moe_phase_hybrid_policy = parse_moe_phase_hybrid_policy(
+            additional_config.get("moe_phase_hybrid_policy", "off")
+        )
 
         self.enable_matmul_allreduce = self._get_config_value(
             additional_config,

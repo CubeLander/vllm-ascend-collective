@@ -61,6 +61,7 @@ from vllm.v1.worker.workspace import init_workspace_manager
 
 import vllm_ascend.envs as envs_ascend
 from vllm_ascend.ascend_config import get_ascend_config, init_ascend_config
+from vllm_ascend.ascend_forward_context import get_moe_phase_hybrid_warmup_phase
 from vllm_ascend.batch_invariant import init_batch_invariance
 from vllm_ascend.cpu_binding import bind_cpus
 from vllm_ascend.device_allocator.camem import CaMemAllocator
@@ -974,9 +975,20 @@ class NPUWorker(WorkerBase):
                 if not any(x in compile_range for x in all_sizes):
                     warmup_sizes.append(compile_range.end)
 
+        # Phase-keyed hybrid MoE policy (experimental, default OFF): the
+        # generic compile-size warmups must run the explicit fused non-decode
+        # phase when the policy is active. Otherwise they default to the
+        # decode phase, which under the policy never executes the fused
+        # non-decode path, so the fused torch.compile artifact would not be
+        # compiled before decode capture. Policy off keeps the historical
+        # _dummy_run(size) call byte-for-byte.
+        moe_warmup_phase = get_moe_phase_hybrid_warmup_phase(self.vllm_config)
         for size in sorted(warmup_sizes, reverse=True):
             logger.info("Compile and warming up model for size %d", size)
-            self.model_runner._dummy_run(size)
+            if moe_warmup_phase is not None:
+                self.model_runner._dummy_run(size, moe_forward_phase=moe_warmup_phase)
+            else:
+                self.model_runner._dummy_run(size)
 
         npugraph_memory_bytes = 0
         if not self.model_config.enforce_eager:

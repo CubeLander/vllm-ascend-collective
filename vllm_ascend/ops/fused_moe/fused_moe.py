@@ -24,7 +24,7 @@ from types import SimpleNamespace
 import torch
 import torch.nn.functional as F
 import torch_npu
-from vllm.config import get_current_vllm_config
+from vllm.config import get_current_vllm_config, get_current_vllm_config_or_none
 from vllm.distributed import get_dp_group, get_ep_group, get_tp_group, tensor_model_parallel_all_reduce
 from vllm.forward_context import get_forward_context
 from vllm.logger import logger
@@ -35,7 +35,12 @@ from vllm.model_executor.layers.fused_moe.layer import (
 )
 
 from vllm_ascend.ascend_config import get_ascend_config
-from vllm_ascend.ascend_forward_context import _EXTRA_CTX, MoECommType
+from vllm_ascend.ascend_forward_context import (
+    _EXTRA_CTX,
+    MoECommType,
+    MoEPhaseHybridPolicy,
+    get_moe_phase_hybrid_policy,
+)
 from vllm_ascend.distributed.parallel_state import get_mc2_group
 from vllm_ascend.eplb.adaptor.vllm_adaptor import VllmEplbAdaptor
 from vllm_ascend.eplb.core.eplb_utils import init_eplb_config
@@ -53,6 +58,29 @@ from vllm_ascend.utils import (
     shared_experts_calculation_stream,
     vllm_version_is,
 )
+
+# Opaque-MoE canary marker: log the policy-local opaque selection once per
+# process instead of once per MoE layer.
+_opaque_moe_canary_logged: bool = False
+
+
+def _moe_phase_hybrid_policy_for_runner() -> MoEPhaseHybridPolicy:
+    """Resolve the phase-keyed hybrid policy while an AscendMoERunner is built.
+
+    ``MoERunner.__init__`` calls ``_select_forward`` during model
+    construction, when the live vllm config is authoritative. Prefer it;
+    fall back to the initialized ``AscendConfig`` singleton (legacy callers).
+    If neither is available the policy resolves to OFF, so stock selection
+    stays byte-for-byte instead of raising during model build.
+    """
+    vllm_config = get_current_vllm_config_or_none()
+    if vllm_config is not None:
+        return get_moe_phase_hybrid_policy(vllm_config)
+    try:
+        return get_ascend_config().moe_phase_hybrid_policy
+    except RuntimeError:
+        return MoEPhaseHybridPolicy.OFF
+
 
 if vllm_version_is("0.23.0"):
     from vllm.model_executor.layers.fused_moe.layer import UnquantizedFusedMoEMethod
@@ -495,6 +523,38 @@ else:
             # PPMissingLayer (nn.Identity) never calls AscendFusedMoE.__init__,
             # so only real MoE layers on this rank are registered.
             VllmEplbAdaptor.register_layer(self)
+
+        def _select_forward(self) -> Callable:
+            """Opaque-MoE canary selection (policy-local, default OFF).
+
+            Under ``moe_phase_hybrid_policy=non_decode_fused`` ONLY, select
+            the already-registered opaque ``torch.ops.vllm.moe_forward`` /
+            ``torch.ops.vllm.moe_forward_shared`` custom-op entries instead
+            of the raw PrivateUse1 ``_moe_forward`` functions the stock
+            selector returns on Ascend. The outer compiled graph then
+            contains only opaque MoE calls and the live ``_forward_impl``
+            dispatch happens at op runtime, so every phase (decode included)
+            shares the one compiled outer artifact. Policy OFF keeps
+            ``super()._select_forward()`` byte-for-byte.
+            """
+            if _moe_phase_hybrid_policy_for_runner() in (
+                MoEPhaseHybridPolicy.NON_DECODE_FUSED,
+                MoEPhaseHybridPolicy.OPAQUE_FUSED_CONTROL,
+            ):
+                global _opaque_moe_canary_logged
+                if not _opaque_moe_canary_logged:
+                    logger.info(
+                        "MoE opaque canary: AscendMoERunner %s selects opaque "
+                        "torch.ops.vllm.moe_forward%s under "
+                        "moe_phase_hybrid_policy=non_decode_fused; the raw "
+                        "PrivateUse1 _moe_forward capture is retired for this "
+                        "policy.",
+                        self.layer_name,
+                        "" if self._shared_experts is None else "_shared",
+                    )
+                    _opaque_moe_canary_logged = True
+                return torch.ops.vllm.moe_forward if self._shared_experts is None else torch.ops.vllm.moe_forward_shared
+            return super()._select_forward()
 
         def _validate_shared_expert_consistency(self):
             """Validate that split shared expert computation matches integrated computation."""

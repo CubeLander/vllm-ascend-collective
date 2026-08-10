@@ -1,10 +1,46 @@
+import sys
+import types
 import unittest
+from contextlib import ExitStack
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import torch
 from vllm.config import CacheConfig, CUDAGraphMode, ModelConfig, ParallelConfig, ProfilerConfig, VllmConfig
 
 from tests.ut.base import TestBase
+from vllm_ascend.ascend_forward_context import MoEForwardPhase
+from vllm_ascend.utils import AscendDeviceType
+
+
+def _install_cpu_torch_npu_op_plugin_stub():
+    """CPU-only UT containers mock torch_npu without torch_npu.op_plugin, yet
+    worker.py imports _register_atb_extensions at module level. Register a
+    no-op stub submodule so NPUWorker can be imported for pure-logic tests;
+    on NPU containers the real torch_npu.op_plugin is left untouched."""
+    torch_npu = sys.modules.get("torch_npu")
+    if torch_npu is None or getattr(torch_npu, "op_plugin", None) is not None:
+        return
+    op_plugin = types.ModuleType("torch_npu.op_plugin")
+    atb = types.ModuleType("torch_npu.op_plugin.atb")
+    atb_ops = types.ModuleType("torch_npu.op_plugin.atb._atb_ops")
+    atb_ops._register_atb_extensions = lambda: None
+    op_plugin.atb = atb
+    atb._atb_ops = atb_ops
+    torch_npu.op_plugin = op_plugin
+    for name, mod in (
+        ("torch_npu.op_plugin", op_plugin),
+        ("torch_npu.op_plugin.atb", atb),
+        ("torch_npu.op_plugin.atb._atb_ops", atb_ops),
+    ):
+        sys.modules[name] = mod
+    # conftest mocks torch_npu.profiler as a plain MagicMock attribute; the
+    # from-import in worker.py needs it reachable as a submodule.
+    if "torch_npu.profiler" not in sys.modules:
+        sys.modules["torch_npu.profiler"] = torch_npu.profiler
+
+
+_install_cpu_torch_npu_op_plugin_stub()
 
 init_cached_hf_modules_path = "vllm.utils.import_utils.init_cached_hf_modules"
 
@@ -1073,6 +1109,9 @@ class TestNPUWorker(TestBase):
             worker.model_config.seed = 12345
             worker.cache_config = MagicMock()
             worker.cache_config.kv_cache_memory_bytes = 1024
+            # Real (empty) additional_config: the policy parser must resolve
+            # the default OFF instead of a MagicMock placeholder.
+            worker.vllm_config.additional_config = {}
 
             # Setup compilation config
             worker.vllm_config.compilation_config = MagicMock()
@@ -1137,6 +1176,9 @@ class TestNPUWorker(TestBase):
             worker.model_config.seed = 67890
             worker.cache_config = MagicMock()
             worker.cache_config.kv_cache_memory_bytes = 1024
+            # Real (empty) additional_config: the policy parser must resolve
+            # the default OFF instead of a MagicMock placeholder.
+            worker.vllm_config.additional_config = {}
 
             # Setup compilation config
             worker.vllm_config.compilation_config = MagicMock()
@@ -1518,3 +1560,81 @@ class TestNPUWorkerWeightUpdate(TestBase):
         worker.shutdown()
 
         engine.shutdown.assert_called_once()
+
+
+def _make_compile_warmup_config(policy_value, compile_sizes):
+    return SimpleNamespace(
+        additional_config={"moe_phase_hybrid_policy": policy_value},
+        compilation_config=SimpleNamespace(
+            compile_sizes=compile_sizes,
+            cudagraph_mode=CUDAGraphMode.NONE,
+            cudagraph_capture_sizes=None,
+            get_compile_ranges=lambda: [],
+            compilation_time=0.5,
+        ),
+        model_config=SimpleNamespace(enforce_eager=True, seed=1234),
+    )
+
+
+def _make_compile_warmup_worker(policy_value, compile_sizes):
+    from vllm_ascend.worker.worker import NPUWorker
+
+    worker = NPUWorker.__new__(NPUWorker)
+    vllm_config = _make_compile_warmup_config(policy_value, compile_sizes)
+    worker.vllm_config = vllm_config
+    worker.model_config = vllm_config.model_config
+    worker.cache_config = SimpleNamespace(kv_cache_memory_bytes=1)
+    runner = SimpleNamespace()
+    runner.dummy_calls = []
+    runner._dummy_run = lambda size, **kwargs: runner.dummy_calls.append((size, kwargs))
+    worker.model_runner = runner
+    return worker, runner
+
+
+def _compile_warmup_patches():
+    return [
+        patch("vllm_ascend.worker.worker.get_ascend_device_type", return_value=AscendDeviceType.A5),
+        patch(
+            "vllm_ascend.worker.worker.get_ascend_config",
+            return_value=SimpleNamespace(enable_cpu_binding=False),
+        ),
+        patch("vllm_ascend.worker.worker.set_random_seed"),
+        patch("vllm_ascend.ascend_forward_context.is_moe_model", return_value=True),
+    ]
+
+
+def _enter_patches(mocks):
+    """Enter several unittest.mock patches as one context manager."""
+    stack = ExitStack()
+    for mock in mocks:
+        stack.enter_context(mock)
+    return stack
+
+
+def test_compile_or_warm_up_model_empty_warmups_policy_active():
+    """Empty compile warmups with the policy active must not call _dummy_run
+    and must not crash: the explicit fused-phase resolution is safe on an
+    empty warmup list (no size can be compiled, so nothing runs)."""
+    worker, runner = _make_compile_warmup_worker("non_decode_fused", [])
+    with _enter_patches(_compile_warmup_patches()):
+        worker.compile_or_warm_up_model()
+    assert runner.dummy_calls == []
+
+
+def test_compile_or_warm_up_model_policy_active_passes_mixed_phase():
+    """Policy active: every compile-size warmup runs the explicit fused
+    non-decode (MIXED) phase so the fused artifact is compiled before decode
+    capture."""
+    worker, runner = _make_compile_warmup_worker("non_decode_fused", [64])
+    with _enter_patches(_compile_warmup_patches()):
+        worker.compile_or_warm_up_model()
+    assert runner.dummy_calls == [(64, {"moe_forward_phase": MoEForwardPhase.MIXED})]
+
+
+def test_compile_or_warm_up_model_policy_off_keeps_historical_phase():
+    """Policy OFF: the warmup stays the historical positional-only
+    _dummy_run(size) call (no phase override), byte-for-byte."""
+    worker, runner = _make_compile_warmup_worker("off", [64])
+    with _enter_patches(_compile_warmup_patches()):
+        worker.compile_or_warm_up_model()
+    assert runner.dummy_calls == [(64, {})]

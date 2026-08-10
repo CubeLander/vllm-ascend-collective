@@ -168,11 +168,15 @@ from vllm_ascend.worker.utils import AscendKVBlockZeroer
 
 from vllm_ascend.ascend_forward_context import (  # isort: skip
     MoECommType,
+    MoEForwardPhase,
+    classify_forward_phase,
     get_mc2_tokens_capacity,
+    get_moe_phase_hybrid_warmup_phase,
     select_moe_comm_method,
     set_ascend_forward_context,
     set_mc2_mask,
     set_mc2_tokens_capacity,
+    should_force_eager_for_moe_phase_hybrid,
 )
 
 from vllm.model_executor.models.interfaces import supports_multimodal_pruning
@@ -2150,6 +2154,27 @@ class NPUModelRunner(GPUModelRunner):
                     num_scheduled_tokens_np,
                 )
 
+                # Host-side forward phase for the phase-keyed hybrid MoE
+                # policy. Derived from CPU scheduler state (attn_state /
+                # with_prefill); never from a device tensor .item() sync.
+                moe_forward_phase = classify_forward_phase(self.attn_state, self.with_prefill)
+                # Two independent phase-keyed decisions (2x2 matrix):
+                # - PURE_DECODE keeps skip_compiled=False (one compiled outer
+                #   artifact shared by every phase; it contains only opaque
+                #   torch.ops.vllm.moe_forward calls, and the live
+                #   _forward_impl dispatch happens at op runtime) and keeps
+                #   force_eager=False so FULL_DECODE_ONLY captures/replays
+                #   the compiled outer artifact with the baseline comm family
+                #   selected at op runtime.
+                # - PURE_PREFILL/MIXED keep skip_compiled=False (same fused
+                #   torch.compile artifact) and force_eager=True so they can
+                #   never be dispatched into or replayed from a decode graph,
+                #   even when uniform_decode misclassifies a 1-token prefill.
+                # skip_compiled is never fed into force_eager.
+                moe_phase_hybrid_force_eager = should_force_eager_for_moe_phase_hybrid(
+                    moe_forward_phase, self.vllm_config
+                )
+
                 num_tokens_unpadded = scheduler_output.total_num_scheduled_tokens
                 if self.pcp_size > 1:
                     num_tokens_unpadded = self.pcp_manager.total_num_sampled_tokens_pcp
@@ -2175,7 +2200,14 @@ class NPUModelRunner(GPUModelRunner):
                     num_scheduled_tokens_np=num_scheduled_tokens_np,
                     max_num_scheduled_tokens=max_num_scheduled_tokens,
                     use_cascade_attn=cascade_attn_prefix_lens is not None,
-                    force_eager=self.model_config.enforce_eager,
+                    # Phase-keyed hybrid: PURE_PREFILL and MIXED forwards force
+                    # eager dispatch (cudagraph NONE) so they fall through the
+                    # outer ACLGraphWrapper and run the fused torch.compile
+                    # artifact; they are never captured into, or replayed
+                    # from, a decode graph. PURE_DECODE keeps force_eager=False
+                    # so FULL capture/replay of the compiled outer artifact
+                    # proceeds (opaque op -> baseline comm family at runtime).
+                    force_eager=self.model_config.enforce_eager or moe_phase_hybrid_force_eager,
                     num_encoder_reqs=len(scheduler_output.scheduled_encoder_inputs),
                 )
 
@@ -2358,6 +2390,7 @@ class NPUModelRunner(GPUModelRunner):
                 has_sinks=self._has_sinks,
                 input_ids=input_ids,
                 eplb_heat_collection_status=self.eplb_heat_collection_status if self.dynamic_eplb else False,
+                forward_phase=moe_forward_phase,
             ),
             self.maybe_get_kv_connector_output(
                 scheduler_output,
@@ -3423,6 +3456,7 @@ class NPUModelRunner(GPUModelRunner):
         num_active_loras: int = 0,
         profile_seq_lens: int | None = None,
         profile_cpp: bool = False,
+        moe_forward_phase: MoEForwardPhase | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         # only support eager mode and piecewise graph now
         assert cudagraph_runtime_mode is None or cudagraph_runtime_mode.valid_runtime_modes()
@@ -3470,6 +3504,12 @@ class NPUModelRunner(GPUModelRunner):
         self.query_lens = torch.from_numpy(num_scheduled_tokens)
         num_tokens_unpadded = int(num_scheduled_tokens.sum())
         num_sampled_tokens = np.ones(num_reqs, dtype=np.int32)
+        # Dummy runs carry the same host phase classification as the runtime
+        # forward so capture-time selection matches replay. The effective
+        # phase is computed once here and reused by the dispatch decision and
+        # the forward context below.
+        if moe_forward_phase is None:
+            moe_forward_phase = MoEForwardPhase.PURE_PREFILL if with_prefill else MoEForwardPhase.PURE_DECODE
         _cudagraph_mode, batch_desc, _, num_tokens_across_dp, _ = self._determine_batch_execution_and_padding(
             num_tokens=num_tokens_unpadded,
             num_reqs=num_reqs,
@@ -3477,7 +3517,16 @@ class NPUModelRunner(GPUModelRunner):
             max_num_scheduled_tokens=max_query_len,
             use_cascade_attn=False,
             allow_microbatching=allow_microbatching,
-            force_eager=is_profile or (cudagraph_runtime_mode == CUDAGraphMode.NONE) or profile_cpp,
+            # Phase-keyed hybrid: non-decode dummy runs (explicit PURE_PREFILL
+            # / MIXED, e.g. profile and compile warmups) force eager dispatch
+            # exactly like the runtime forward, so a fused template can never
+            # be captured into the decode graph pool.
+            force_eager=(
+                is_profile
+                or (cudagraph_runtime_mode == CUDAGraphMode.NONE)
+                or profile_cpp
+                or should_force_eager_for_moe_phase_hybrid(moe_forward_phase, self.vllm_config)
+            ),
             # `force_uniform_decode` is used for cudagraph capture; because for
             # capturing mixed prefill-decode batches, we sometimes use
             # num_tokens == num_reqs which looks like a uniform decode batch to the
@@ -3667,6 +3716,9 @@ class NPUModelRunner(GPUModelRunner):
                 has_sinks = self._has_sinks,
                 input_ids=input_ids,
                 eplb_heat_collection_status=self.eplb_heat_collection_status if self.dynamic_eplb else False,
+                # Dummy runs carry the same host phase classification as the
+                # runtime forward so capture-time selection matches replay.
+                forward_phase=moe_forward_phase,
             ):
                 outputs = self._model_forward(
                     num_tokens_padded, input_ids, positions, intermediate_tensors, inputs_embeds
@@ -3721,10 +3773,43 @@ class NPUModelRunner(GPUModelRunner):
     def profile_run(self) -> None:
         self.eplb_warmup()
         mc2_tokens_capacity = get_mc2_tokens_capacity()
-        if self.max_num_tokens > mc2_tokens_capacity and select_moe_comm_method(
+        moe_warmup_phase = get_moe_phase_hybrid_warmup_phase(self.vllm_config)
+        if moe_warmup_phase is not None:
+            # Phase-keyed hybrid policy ACTIVE: the fused non-decode dummy is
+            # UNCONDITIONAL and FIRST. The historical MC2-capacity condition
+            # could skip it (max_num_tokens <= capacity, or a non-MC2 comm
+            # family), which would leave the fused torch.compile artifact
+            # uncompiled and its workspace unprofiled before decode
+            # warmup/capture. min() keeps the dummy size valid for _dummy_run's
+            # num_tokens <= max_num_batched_tokens assertion while staying
+            # inside the fused MC2 token capacity; if the static fused gate is
+            # unavailable, the selector raises fail-fast right here, before
+            # super().profile_run() and before any decode capture.
+            self._dummy_run(
+                min(self.max_num_tokens, mc2_tokens_capacity),
+                with_prefill=True,
+                moe_forward_phase=MoEForwardPhase.MIXED,
+                is_profile=True,
+            )
+        elif self.max_num_tokens > mc2_tokens_capacity and select_moe_comm_method(
             mc2_tokens_capacity, self.vllm_config
         ) in {MoECommType.MC2, MoECommType.FUSED_MC2}:
-            self._dummy_run(mc2_tokens_capacity, with_prefill=True, is_profile=True)
+            # Under the phase hybrid, explicitly warm/profile the fused
+            # non-decode path (PURE_PREFILL and MIXED both select FUSED_MC2
+            # under the gate). This runs BEFORE any decode warmup/capture, so
+            # the fused torch.compile artifact is deterministically compiled
+            # first and its workspace is included in memory profiling, and the
+            # baseline decode workspace (selected at opaque-op runtime) is
+            # profiled by the later decode capture. The default-off path keeps
+            # the historical PURE_PREFILL
+            # dummy unchanged.
+            profile_moe_phase = get_moe_phase_hybrid_warmup_phase(self.vllm_config) or MoEForwardPhase.PURE_PREFILL
+            self._dummy_run(
+                mc2_tokens_capacity,
+                with_prefill=True,
+                moe_forward_phase=profile_moe_phase,
+                is_profile=True,
+            )
         origin_max_num_tokens = self.max_num_tokens
         # in the pcp scenario, the split sequence needs to be used for profile run
         # TODO: after the vllm pcp function is launched, this logic needs to be brought up to the community

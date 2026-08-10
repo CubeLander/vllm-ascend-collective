@@ -6,7 +6,8 @@ import numpy as np
 import torch
 from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheConfig, KVCacheGroupSpec, KVCacheTensor
 
-from vllm_ascend.worker.model_runner_v1 import NPUModelRunner
+from vllm_ascend.ascend_forward_context import MoECommType, MoEForwardPhase
+from vllm_ascend.worker.model_runner_v1 import GPUModelRunner, NPUModelRunner
 
 
 class TestNPUModelRunnerKVCache(unittest.TestCase):
@@ -312,6 +313,140 @@ class TestCorrectOptimisticSeqLensCpu(unittest.TestCase):
         runner.valid_sampled_token_count_event = None
         with self.assertRaises(AssertionError):
             runner._correct_optimistic_seq_lens_cpu(1)
+
+
+class _ProfileRunProbe(NPUModelRunner):
+    """Minimal NPUModelRunner shell for profile_run ordering/selection tests.
+
+    Deliberately avoids the real constructor (device init is out of scope for
+    CPU unit tests); only the attributes profile_run touches are provided.
+    The probe's own ``_dummy_run`` records both the call and its position
+    relative to ``super().profile_run()``.
+    """
+
+    def __init__(self, vllm_config, max_num_tokens, pcp_size=1):
+        self.vllm_config = vllm_config
+        self.max_num_tokens = max_num_tokens
+        self.pcp_size = pcp_size
+        self.dummy_calls = []
+        self.order = []
+
+    def eplb_warmup(self):
+        pass
+
+    def _dummy_run(self, size, **kwargs):
+        self.dummy_calls.append((size, kwargs))
+        self.order.append("dummy")
+
+
+def _moe_phase_hybrid_config(policy_value):
+    return SimpleNamespace(
+        additional_config={"moe_phase_hybrid_policy": policy_value},
+        model_config=SimpleNamespace(
+            hf_text_config=SimpleNamespace(),
+            get_num_experts=lambda: 64,
+        ),
+        parallel_config=SimpleNamespace(
+            enable_expert_parallel=True,
+            world_size_across_dp=8,
+            pipeline_parallel_size=1,
+            data_parallel_size=1,
+        ),
+    )
+
+
+def _run_profile_probe(policy_value, max_num_tokens, mc2_capacity, select_return):
+    """Run NPUModelRunner.profile_run on a probe and return (dummy_calls, order)."""
+    probe = _ProfileRunProbe(_moe_phase_hybrid_config(policy_value), max_num_tokens)
+
+    def _recording_super(*args):
+        # patch.object replaces profile_run with a MagicMock, which is not a
+        # descriptor, so the implicit `self` is NOT bound; accept any args.
+        probe.order.append("super")
+
+    with (
+        patch("vllm_ascend.worker.model_runner_v1.get_mc2_tokens_capacity", return_value=mc2_capacity),
+        patch("vllm_ascend.worker.model_runner_v1.select_moe_comm_method", return_value=select_return),
+        patch("vllm_ascend.ascend_forward_context.is_moe_model", return_value=True),
+        patch.object(GPUModelRunner, "profile_run", side_effect=_recording_super),
+    ):
+        probe.profile_run()
+    return probe.dummy_calls, probe.order
+
+
+def test_profile_run_policy_active_unconditional_and_first_even_within_capacity():
+    """Policy active: the fused non-decode MIXED dummy is UNCONDITIONAL and
+    FIRST. max_num_tokens=32 <= mc2_capacity=64 would have been skipped by
+    the historical capacity condition, yet the dummy must still run before
+    super().profile_run()."""
+    dummy_calls, order = _run_profile_probe(
+        "non_decode_fused", max_num_tokens=32, mc2_capacity=64, select_return=MoECommType.FUSED_MC2
+    )
+    assert order == ["dummy", "super"]
+    assert len(dummy_calls) == 1
+    size, kwargs = dummy_calls[0]
+    assert size == 32  # min(max_num_tokens, capacity)
+    assert kwargs == {
+        "with_prefill": True,
+        "moe_forward_phase": MoEForwardPhase.MIXED,
+        "is_profile": True,
+    }
+
+
+def test_profile_run_policy_active_min_size_caps_at_capacity():
+    """Policy active, max_num_tokens > capacity: dummy size is capped at the
+    fused MC2 token capacity (a valid size for _dummy_run)."""
+    dummy_calls, order = _run_profile_probe(
+        "non_decode_fused", max_num_tokens=128, mc2_capacity=64, select_return=MoECommType.FUSED_MC2
+    )
+    assert order == ["dummy", "super"]
+    assert len(dummy_calls) == 1
+    size, kwargs = dummy_calls[0]
+    assert size == 64
+    assert kwargs["with_prefill"] is True
+    assert kwargs["moe_forward_phase"] is MoEForwardPhase.MIXED
+    assert kwargs["is_profile"] is True
+
+
+def test_profile_run_policy_active_ignores_selector_for_dummy():
+    """Policy active: the dummy selection does not depend on the stock
+    selector result (ALLGATHER would have skipped the historical dummy too),
+    because the fused gate is static and validated fail-fast elsewhere."""
+    dummy_calls, order = _run_profile_probe(
+        "non_decode_fused", max_num_tokens=128, mc2_capacity=64, select_return=MoECommType.ALLGATHER
+    )
+    assert order == ["dummy", "super"]
+    assert len(dummy_calls) == 1
+    size, kwargs = dummy_calls[0]
+    assert size == 64
+    assert kwargs["moe_forward_phase"] is MoEForwardPhase.MIXED
+
+
+def test_profile_run_policy_off_keeps_historical_conditional_dummy():
+    """Policy OFF: the historical conditional dummy is preserved -- skipped
+    within MC2 capacity, and run with the historical PURE_PREFILL phase at
+    size==capacity when max_num_tokens exceeds it and the stock selector
+    picks an MC2-family comm."""
+    # max_num_tokens <= capacity: historical condition skips the dummy.
+    dummy_calls, order = _run_profile_probe(
+        "off", max_num_tokens=32, mc2_capacity=64, select_return=MoECommType.FUSED_MC2
+    )
+    assert dummy_calls == []
+    assert order == ["super"]
+    # max_num_tokens > capacity + MC2-family stock selector: historical
+    # dummy runs at exactly mc2_tokens_capacity with PURE_PREFILL.
+    dummy_calls, order = _run_profile_probe(
+        "off", max_num_tokens=128, mc2_capacity=64, select_return=MoECommType.FUSED_MC2
+    )
+    assert order == ["dummy", "super"]
+    assert len(dummy_calls) == 1
+    size, kwargs = dummy_calls[0]
+    assert size == 64
+    assert kwargs == {
+        "with_prefill": True,
+        "moe_forward_phase": MoEForwardPhase.PURE_PREFILL,
+        "is_profile": True,
+    }
 
 
 if __name__ == "__main__":
