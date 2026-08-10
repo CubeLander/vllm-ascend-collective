@@ -74,7 +74,10 @@ def _run_rank(rank: int, world_size: int, port: int) -> None:
         weight2_nz = [torch_npu.npu_format_cast(weight2.npu(), 29)]
         scale1 = [scale_from_float_to_int64(torch.ones((local_experts, gate_up_size))).npu()]
         scale2 = [scale_from_float_to_int64(torch.ones((local_experts, hidden_size))).npu()]
-        empty_bias = [torch.empty(0, dtype=torch.float32)]
+        # Keep the mandatory empty bias placeholder on the same device as the
+        # NPU input/weights, matching the real call path instead of forcing
+        # an implicit host-to-device transfer.
+        empty_bias = [torch.empty(0, dtype=torch.float32).npu()]
 
         probs_cpu = torch.arange(1, top_k + 1, dtype=torch.float32).repeat(tokens, 1)
         probs_cpu /= probs_cpu.sum(dim=-1, keepdim=True)

@@ -210,3 +210,30 @@ def test_select_moe_comm_method_a2_fused_float_over_capacity_falls_back():
         # Over capacity: fail closed to the non-fused all-gather path.
         assert select_moe_comm_method(65, vllm_config) is MoECommType.ALLGATHER
         assert select_moe_comm_method(128, vllm_config) is MoECommType.ALLGATHER
+
+
+def test_select_moe_comm_method_a2_w8a8_over_capacity_falls_back():
+    """W8A8 dynamic fused MC2 shares the A2 capacity guard.
+
+    The W8A8 route must keep selecting the fused path within
+    mc2_tokens_capacity (boundary included) and fail closed to the non-fused
+    all-gather path above capacity, mirroring the parent BF16 guard without
+    duplicating that test case.
+    """
+    vllm_config = _make_moe_config(ep_size=2, quant_type="w8a8_dynamic", num_experts=16)
+    ep_group = SimpleNamespace(world_size=2)
+    ascend_config = SimpleNamespace(enable_fused_mc2=1)
+
+    with (
+        patch("vllm_ascend.ascend_forward_context.is_moe_model", return_value=True),
+        patch("vllm_ascend.ascend_forward_context.get_mc2_tokens_capacity", return_value=64),
+        patch("vllm_ascend.ascend_forward_context.get_ascend_device_type", return_value=AscendDeviceType.A2),
+        patch("vllm_ascend.ascend_forward_context.get_ep_group", return_value=ep_group),
+        patch("vllm_ascend.ascend_forward_context.get_ascend_config", return_value=ascend_config),
+    ):
+        # Within capacity, including the boundary: W8A8 fused path selected.
+        assert select_moe_comm_method(32, vllm_config) is MoECommType.FUSED_MC2
+        assert select_moe_comm_method(64, vllm_config) is MoECommType.FUSED_MC2
+        # Over capacity: fail closed to the non-fused all-gather path.
+        assert select_moe_comm_method(65, vllm_config) is MoECommType.ALLGATHER
+        assert select_moe_comm_method(128, vllm_config) is MoECommType.ALLGATHER
