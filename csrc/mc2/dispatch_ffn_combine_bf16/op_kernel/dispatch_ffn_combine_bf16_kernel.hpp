@@ -664,7 +664,10 @@ private:
             AscendC::GlobalTensor<int32_t> srcAddress;
             srcAddress.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t*>(shmem() + localTokenPerExpertOffset));
             AscendC::GlobalTensor<int32_t> dstAddress;
-            __gm__ void* dstPeermemPtr = shmem(localTokenPerExpertOffset, coreIdx);
+            // Each worker publishes this rank's count row to the peer rank it
+            // owns.  coreIdx is only a work-partition index and may exceed EP;
+            // using it as a peer id silently redirects half of an EP=2 wave.
+            __gm__ void* dstPeermemPtr = shmem(localTokenPerExpertOffset, dstEpIdx);
             dstAddress.SetGlobalBuffer((__gm__ int32_t * )dstPeermemPtr);
 
             AscendC::SetFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID0);
