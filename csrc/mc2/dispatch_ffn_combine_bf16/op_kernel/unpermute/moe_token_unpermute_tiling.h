@@ -29,7 +29,12 @@ MoeTokenUnpermuteTiling(int32_t m, int32_t n, int32_t topK, MoeTokenUnpermuteTil
     uint32_t outTokens = m / topK;
     tilingData.tokens_core_length = I64(outTokens / coreNum);
     tilingData.tokens_core_remain = I64(outTokens % coreNum);
-    tilingData.tokens_splited_length = I64(min(tilingData.tokens_core_length, 600));
+    // When there are fewer output tokens than vector cores, idle cores own
+    // zero tokens. Keep their split quantum non-zero so the following integer
+    // divisions remain defined; their split count/remain both stay zero and
+    // Process() performs no token work on those cores.
+    tilingData.tokens_splited_length = I64(
+        tilingData.tokens_core_length == 0 ? 1 : min(tilingData.tokens_core_length, I64(600)));
     tilingData.tokens_splited_num = I64(tilingData.tokens_core_length / tilingData.tokens_splited_length);
     tilingData.tokens_splited_remain = I64(tilingData.tokens_core_length % tilingData.tokens_splited_length);
     tilingData.buffer_num = 4;

@@ -105,6 +105,7 @@ public:
         uint32_t rankSize;
         int32_t ubMoveNum;
         GM_ADDR symmetricPtr;
+        GM_ADDR mc2InitTiling;
         //--------------
         GM_ADDR expertIdx;
         GM_ADDR moeInitRoutingQuantV2Scale;
@@ -115,6 +116,7 @@ public:
         GM_ADDR expertTokensBeforeCapacity;
         GM_ADDR dynamicQuantScale;
         GM_ADDR probs;
+        GM_ADDR ptrXActiveMask;
         int64_t topK;
         uint64_t initRoutingQuantTilingKey;
         uint32_t epilogueCoreNum;
@@ -142,7 +144,9 @@ public:
             GM_ADDR moeInitRoutingQuantV2Offset_,
             GM_ADDR expertTokensBeforeCapacity_, GM_ADDR probs_,
             GM_ADDR ptrWorkspace_, GM_ADDR gmExpertTokenNums_, int32_t ubMoveNum_,
+            GM_ADDR ptrXActiveMask_,
             optiling::MoeInitRoutingV2TilingData moeInitRoutingQuantV2TilingData_,
+            GM_ADDR mc2InitTiling_,
             GM_ADDR symmetricPtr_ = nullptr
         ) : problemShape(problemShape_),
             EP(EP_), listLen(listLen_), expertPerRank(expertPerRank_), maxOutputSize(maxOutputSize_),
@@ -158,7 +162,9 @@ public:
             expertIdx(expertIdx_), moeInitRoutingQuantV2Scale(moeInitRoutingQuantV2Scale_),
             moeInitRoutingQuantV2Offset(moeInitRoutingQuantV2Offset_),
             expertTokensBeforeCapacity(expertTokensBeforeCapacity_), probs(probs_),
-            ptrWorkspace(ptrWorkspace_), ptrExpertTokenNums(gmExpertTokenNums_), ubMoveNum(ubMoveNum_),symmetricPtr(symmetricPtr_),
+            ptrWorkspace(ptrWorkspace_), ptrExpertTokenNums(gmExpertTokenNums_), ubMoveNum(ubMoveNum_),
+            ptrXActiveMask(ptrXActiveMask_),
+            symmetricPtr(symmetricPtr_), mc2InitTiling(mc2InitTiling_),
             moeInitRoutingQuantV2TilingData(moeInitRoutingQuantV2TilingData_)
         {
             moeInitRoutingQuantV2TilingData.vbsComputeParamsOp = moeInitRoutingQuantV2TilingData_.vbsComputeParamsOp;
@@ -217,7 +223,9 @@ public:
 
 private:
     CATLASS_DEVICE void initBuffer(Params const &params) {
-        #ifndef HCCL_COMM
+        #ifdef HCCL_COMM
+            shmem.initHccl(params.mc2InitTiling);
+        #else
             shmem.initShmem(params.symmetricPtr, params.rank, params.rankSize);
         #endif
         workspaceInfo = WorkspaceInfo(params);
@@ -236,8 +244,10 @@ private:
 
         tokenPerExpert.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t *>(shmem() + peermemInfo.offsetPeerTokenPerExpert));
 
-        tokenPerExpertLayout = Layout3D(AlignUp(params.EP * params.expertPerRank, ALIGN_128), params.expertPerRank);
+        paddedExpertNumAligned = AlignUp(params.EP * params.expertPerRank + 1, ALIGN_128);
+        tokenPerExpertLayout = Layout3D(paddedExpertNumAligned, params.expertPerRank);
         preSumBeforeRank.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t*>(workspaceInfo.ptrSumBeforeRank));
+        gmXActiveMask.SetGlobalBuffer(reinterpret_cast<__gm__ bool*>(params.ptrXActiveMask));
     }
 
     template<typename T>
@@ -303,8 +313,9 @@ private:
 
         AscendC::DataCopyPad(
             tmpBuffer1,
-            tokenPerExpert[rankId * expertPerRank],
-            {U16(EP), U16(expertPerRank * sizeof(int32_t)), U16((AlignUp(EP * expertPerRank, 128) - expertPerRank) * sizeof(int32_t)), 0},
+            tokenPerExpert[tokenPerExpertLayout(rankId, 0, 0)],
+            {U16(EP), U16(expertPerRank * sizeof(int32_t)),
+             U16((paddedExpertNumAligned - expertPerRank) * sizeof(int32_t)), 0},
             {}
         );
 
@@ -355,6 +366,53 @@ private:
         AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID0);
         AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID0);
         AscendC::DataCopy(tokenPerExpert, tmp, num);
+    }
+
+    CATLASS_DEVICE
+    GM_ADDR ApplyXActiveMask(Params const &params)
+    {
+        if (params.ptrXActiveMask == nullptr) {
+            return params.expertIdx;
+        }
+
+        const int32_t m = params.problemShape.m();
+        const int32_t topK = params.topK;
+        const int32_t sentinelExpert = params.expertPerRank * params.EP;
+        const int32_t totalElements = m * topK;
+        const int32_t base = totalElements / coreNum;
+        const int32_t remainder = totalElements % coreNum;
+        const int32_t startIdx = coreIdx * base + min(coreIdx, remainder);
+        const int32_t endIdx = (coreIdx + 1) * base + min(coreIdx + 1, remainder);
+        const int32_t copySize = endIdx - startIdx;
+
+        if (copySize > 0) {
+            AscendC::GlobalTensor<int32_t> expertIdxGm;
+            AscendC::GlobalTensor<int32_t> maskedExpertIdxGm;
+            expertIdxGm.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t*>(params.expertIdx));
+            maskedExpertIdxGm.SetGlobalBuffer(
+                reinterpret_cast<__gm__ int32_t*>(workspaceInfo.ptrMaskedExpertIdx));
+            AscendC::LocalTensor<int32_t> tmpExpertIdx =
+                resource.ubBuf.template GetBufferByByte<int32_t>(0);
+
+            AscendC::DataCopyPad(tmpExpertIdx[0], expertIdxGm[startIdx],
+                {1, static_cast<uint16_t>(copySize * sizeof(int32_t)), 0, 0}, {});
+            AscendC::SetFlag<AscendC::HardEvent::MTE2_S>(EVENT_ID0);
+            AscendC::WaitFlag<AscendC::HardEvent::MTE2_S>(EVENT_ID0);
+
+            for (int32_t i = 0; i < copySize; ++i) {
+                const int32_t tokenIdx = (startIdx + i) / topK;
+                if (!gmXActiveMask(tokenIdx)) {
+                    tmpExpertIdx.SetValue(i, sentinelExpert);
+                }
+            }
+
+            AscendC::SetFlag<AscendC::HardEvent::S_MTE3>(EVENT_ID0);
+            AscendC::WaitFlag<AscendC::HardEvent::S_MTE3>(EVENT_ID0);
+            AscendC::DataCopyPad(maskedExpertIdxGm[startIdx], tmpExpertIdx[0],
+                {1, static_cast<uint16_t>(copySize * sizeof(int32_t)), 0, 0, 0});
+        }
+        AscendC::SyncAll<true>();
+        return workspaceInfo.ptrMaskedExpertIdx;
     }
 
     CATLASS_DEVICE
@@ -595,7 +653,7 @@ private:
 
     CATLASS_DEVICE
     void CrossRankSyncAndlocalTokenPerExpertAllGatherAndGetSumPreRankV2(Params const &params, int64_t localTokenPerExpertOffset){
-        uint32_t numPerCore = AlignUp(params.EP * params.expertPerRank, 128);
+        uint32_t numPerCore = paddedExpertNumAligned;
         AscendC::LocalTensor<int32_t> tmpBuffer = resource.ubBuf.template GetBufferByByte<int32_t>(0);
         AscendC::LocalTensor<int32_t> prevSumBuf = tmpBuffer[numPerCore];
 
@@ -636,7 +694,7 @@ private:
         for(int32_t dstEpIdx = coreIdx; dstEpIdx < params.EP; dstEpIdx += coreNum) {
             if (dstEpIdx != params.rank) {
                 int32_t intPer512 = CACHE_LINE / sizeof(int);
-                for(int32_t checkIdx = 0; checkIdx < AlignUp(params.EP * params.expertPerRank, 128); checkIdx += intPer512) {
+                for(int32_t checkIdx = 0; checkIdx < paddedExpertNumAligned; checkIdx += intPer512) {
                     __gm__ int32_t* sync_check = reinterpret_cast<__gm__ int32_t*>(shmem() + peermemInfo.offsetPeerTokenPerExpert) + tokenPerExpertLayout(dstEpIdx, 0, checkIdx);
                     gm_signal_wait_until_ne(sync_check, 0);
                 }
@@ -743,11 +801,11 @@ private:
         icache_preload(8);
         int64_t localTokenPerExpertOffset = peermemInfo.offsetPeerTokenPerExpert + tokenPerExpertLayout(params.rank, 0, 0) * sizeof(int32_t);
         GM_ADDR localTokenPerExpert = shmem() + localTokenPerExpertOffset;
-        uint32_t expandedRowIdxOffset = AlignUp(params.problemShape.m(), 256) * params.topK * sizeof(int32_t);
+        GM_ADDR routingExpertIdx = ApplyXActiveMask(params);
 
-        moe_init_routing_v2<ElementA>(reinterpret_cast<GM_ADDR> (params.ptrA), params.expertIdx, shmem() + peermemInfo.offsetA,
+        moe_init_routing_v2<ElementA>(reinterpret_cast<GM_ADDR> (params.ptrA), routingExpertIdx, shmem() + peermemInfo.offsetA,
         workspaceInfo.expandedRowIdx, localTokenPerExpert, params.expertTokensBeforeCapacity,
-        params.ptrWorkspace + expandedRowIdxOffset,
+        workspaceInfo.ptrInitRoutingWorkspace,
         &params.moeInitRoutingQuantV2TilingData, params.initRoutingQuantTilingKey);
 
         AscendC::SyncAll<true>();
@@ -838,7 +896,8 @@ private:
             static_cast<int32_t>(n2),
             static_cast<int32_t>(L1TileShape::N),
             shmem,
-            static_cast<int32_t>(peermemInfo.offsetD)
+            static_cast<int32_t>(peermemInfo.offsetD),
+            tokenPerExpertLayout
         };
 
         BlockEpilogue2 blockEpilogue2(resource, epilogueParams);
@@ -891,7 +950,7 @@ private:
 
         AscendC::SyncAll<true>();
         #ifndef __CROSSRANKSYNCANDALLGATHERV1__
-        ResetTokenPerExpert(params.EP * AlignUp(params.EP * params.expertPerRank, 128));
+        ResetTokenPerExpert(params.EP * paddedExpertNumAligned);
         #endif
         shmem.InitStatusTargetSum();
         if (get_subblockid() == 0) {
@@ -990,6 +1049,8 @@ private:
 
 private:
   struct WorkspaceInfo {
+        GM_ADDR ptrMaskedExpertIdx;
+        GM_ADDR ptrInitRoutingWorkspace;
         GM_ADDR ptrA;
         GM_ADDR ptrPerTokenScale;
         GM_ADDR ptrcumsumMM;
@@ -1013,11 +1074,23 @@ private:
             expandedRowIdx = params.ptrWorkspace;
 
             workspaceOffset += AlignUp(params.problemShape.m(), 256) * params.topK * sizeof(int32_t);
+            // The masked route IDs are dead after init-routing, so this slice
+            // becomes the cumsum region for the fused pipeline.
+            ptrMaskedExpertIdx = params.ptrWorkspace + workspaceOffset;
             ptrcumsumMM = params.ptrWorkspace + workspaceOffset;
 
-            workspaceOffset += (params.EP * params.EP * params.expertPerRank) * sizeof(int32_t);
+            const int64_t maskedExpertIdxSize =
+                AlignUp(params.problemShape.m() * params.topK * sizeof(int32_t), 32);
+            ptrInitRoutingWorkspace = ptrMaskedExpertIdx + maskedExpertIdxSize;
 
-            workspaceOffset += (params.EP * params.EP * params.expertPerRank) * sizeof(int32_t);
+            const int64_t countMatrixSize =
+                (params.EP * params.EP * params.expertPerRank) * sizeof(int32_t);
+            // Init-routing owns the route scratch first. After it completes,
+            // the fused pipeline reuses the beginning as cumsum storage; the
+            // next persistent region must start after the larger lifetime.
+            workspaceOffset += max(maskedExpertIdxSize, countMatrixSize);
+
+            workspaceOffset += countMatrixSize;
             ptrPerTokenScale = params.ptrWorkspace + workspaceOffset;
 
             workspaceOffset += params.maxOutputSize * sizeof(ElementPerTokenScale);
@@ -1026,7 +1099,7 @@ private:
             workspaceOffset += params.maxOutputSize * sizeof(ElementPerTokenScale);
             ptrTokenPerExpert =  params.ptrWorkspace + workspaceOffset;
 
-            workspaceOffset += (params.EP * params.EP * params.expertPerRank) * sizeof(int32_t);
+            workspaceOffset += countMatrixSize;
             ptrC = params.ptrWorkspace + workspaceOffset; //7
 
             workspaceOffset += params.maxOutputSize * params.problemShape.n() * sizeof(ElementC);
@@ -1084,12 +1157,15 @@ private:
     AscendC::GlobalTensor<ElementPerTokenScale> gmPerTokenScale1;
     AscendC::GlobalTensor<ElementPerTokenScale> gmPerTokenScale2;
 
+    AscendC::GlobalTensor<bool> gmXActiveMask;
+
     AscendC::GlobalTensor<int32_t> tokenPerExpert;
     AscendC::GlobalTensor<int32_t> cumsumMM;
     AscendC::GlobalTensor<int32_t> preSumBeforeRank;
 
     Layout3D tokenPerExpertLayout;
     HcclShmem shmem;
+    int32_t paddedExpertNumAligned;
 };
 
 } // namespace Catlass::Gemm::Kernel

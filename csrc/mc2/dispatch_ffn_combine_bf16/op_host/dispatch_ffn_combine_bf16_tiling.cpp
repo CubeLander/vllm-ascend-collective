@@ -21,6 +21,9 @@
 #include <vector>
 #include <map>
 #include <algorithm>
+#include <cstdlib>
+#include <limits>
+#include <string>
 #include "moe_init_routing_v2/moe_init_routing_v2_tiling.h"
 
 using namespace AscendC;
@@ -39,12 +42,112 @@ namespace {
     constexpr uint32_t WEIGHT_INDEX = 1;
     constexpr uint32_t WEIGHT2_INDEX = 2;
     constexpr uint32_t EXPERTID_INDEX = 3;
+    constexpr uint32_t PROBS_INDEX = 6;
+    constexpr uint32_t X_ACTIVE_MASK_INDEX = 7;
+    constexpr uint32_t OUT_INDEX = 0;
+    constexpr uint32_t EXPERT_TOKEN_NUMS_INDEX = 1;
     constexpr uint32_t BLOCK_NUM = 20;
     constexpr uint32_t SYSTEM_NEED_WORKSPACE = 16 * 1024 * 1024;
     constexpr uint64_t MB_SIZE = 1024 * 1024UL;
+    constexpr uint32_t MIN_WORLD_SIZE = 2;
+    constexpr uint32_t MAX_WORLD_SIZE = 8;
+    constexpr uint32_t MIN_LOCAL_EXPERTS = 3;
+    constexpr uint32_t MAX_LOCAL_EXPERTS = 64;
+    constexpr uint32_t MAX_TOP_K = 8;
+    constexpr uint32_t MAX_LOCAL_TOKENS = 512;
+    constexpr uint32_t MAX_EXPERT_NUM = 5120;
+    constexpr uint32_t COUNT_CONTROL_TAIL_SIZE = 2 * MB_SIZE;
+    constexpr uint32_t COUNT_MATRIX_REGION_SIZE = MB_SIZE;
+    constexpr uint32_t CONTROL_REGION_SIZE = MB_SIZE;
+    constexpr uint32_t PER_TOKEN_SCALE_REGION_SIZE = MB_SIZE;
+    constexpr uint32_t WINDOW_ALIGNMENT = 512;
 }
 
 namespace optiling {
+
+static uint64_t GetConfiguredWindowSize()
+{
+    uint64_t windowSizeMiB = 200;
+    const char *configured = getenv("HCCL_BUFFSIZE");
+    if (configured == nullptr) {
+        return windowSizeMiB * MB_SIZE;
+    }
+
+    try {
+        const std::string value(configured);
+        size_t parsedChars = 0;
+        windowSizeMiB = std::stoull(value, &parsedChars);
+        if (parsedChars != value.size() || windowSizeMiB > std::numeric_limits<uint16_t>::max()) {
+            OP_LOGW(K_INNER_DEBUG, "Invalid HCCL_BUFFSIZE=%s; use the 200 MiB default.", configured);
+            windowSizeMiB = 200;
+        }
+    } catch (const std::exception &e) {
+        OP_LOGW(K_INNER_DEBUG, "Cannot parse HCCL_BUFFSIZE=%s (%s); use the 200 MiB default.", configured, e.what());
+        windowSizeMiB = 200;
+    }
+    return windowSizeMiB * MB_SIZE;
+}
+
+static ge::graphStatus DispatchFFNCombineBF16CheckPhysicalDomain(
+    gert::TilingContext *context, const DispatchFFNCombineBF16Info &info)
+{
+    const char *nodeName = context->GetNodeName();
+    const uint64_t routeRows = static_cast<uint64_t>(info.M) * info.topK;
+    const uint64_t globalExperts = static_cast<uint64_t>(info.expertPerRank) * info.worldSize;
+    const uint64_t alignedGlobalExperts = (globalExperts + 1 + 127) / 128 * 128;
+    const uint64_t countBytes = static_cast<uint64_t>(info.worldSize) * alignedGlobalExperts * sizeof(int32_t);
+    // init-routing expands every local token into top-k routed rows inside
+    // this rank's peer window.
+    const uint64_t inputBytes = routeRows * info.K * sizeof(int16_t);
+    const uint64_t outputBytes = static_cast<uint64_t>(info.maxOutputSize) * info.K * sizeof(int16_t);
+    const uint64_t windowBytes = GetConfiguredWindowSize();
+    const uint64_t scaleOffset = ((windowBytes / 3 + WINDOW_ALIGNMENT - 1) / WINDOW_ALIGNMENT) * WINDOW_ALIGNMENT;
+    const uint64_t outputOffset = scaleOffset + PER_TOKEN_SCALE_REGION_SIZE;
+    const uint64_t countOffset =
+        windowBytes >= COUNT_CONTROL_TAIL_SIZE ? windowBytes - COUNT_CONTROL_TAIL_SIZE : 0;
+
+    OP_TILING_CHECK(info.worldSize < MIN_WORLD_SIZE || info.worldSize > MAX_WORLD_SIZE,
+        OP_LOGE(nodeName, "BF16 dispatch_ffn_combine requires EP in [%u, %u], got %u.",
+            MIN_WORLD_SIZE, MAX_WORLD_SIZE, info.worldSize), return ge::GRAPH_FAILED);
+    OP_TILING_CHECK(info.expertPerRank < MIN_LOCAL_EXPERTS || info.expertPerRank > MAX_LOCAL_EXPERTS,
+        OP_LOGE(nodeName, "BF16 dispatch_ffn_combine requires local experts in [%u, %u], got %u.",
+            MIN_LOCAL_EXPERTS, MAX_LOCAL_EXPERTS, info.expertPerRank), return ge::GRAPH_FAILED);
+    OP_TILING_CHECK(globalExperts + 1 > MAX_EXPERT_NUM,
+        OP_LOGE(nodeName, "BF16 dispatch_ffn_combine global expert domain %lu exceeds route limit %u.",
+            globalExperts + 1, MAX_EXPERT_NUM), return ge::GRAPH_FAILED);
+    OP_TILING_CHECK(info.M == 0 || info.M > MAX_LOCAL_TOKENS,
+        OP_LOGE(nodeName, "BF16 dispatch_ffn_combine local tokens must be in [1, %u], got %u.",
+            MAX_LOCAL_TOKENS, info.M), return ge::GRAPH_FAILED);
+    OP_TILING_CHECK(info.topK == 0 || info.topK > MAX_TOP_K,
+        OP_LOGE(nodeName, "BF16 dispatch_ffn_combine top-k must be in [1, %u], got %u.",
+            MAX_TOP_K, info.topK), return ge::GRAPH_FAILED);
+    OP_TILING_CHECK(info.K == 0 || info.N == 0 || info.K % 256 != 0 || info.N % 256 != 0,
+        OP_LOGE(nodeName, "BF16 dispatch_ffn_combine requires K and gate/up width N to be positive multiples of 256, got K=%u N=%u.",
+            info.K, info.N), return ge::GRAPH_FAILED);
+    OP_TILING_CHECK(info.topK > globalExperts,
+        OP_LOGE(nodeName, "BF16 dispatch_ffn_combine top-k=%u exceeds global experts=%lu.",
+            info.topK, globalExperts), return ge::GRAPH_FAILED);
+    const uint64_t requiredReceiverRows = routeRows * info.worldSize;
+    OP_TILING_CHECK(info.maxOutputSize == 0 || info.maxOutputSize < requiredReceiverRows,
+        OP_LOGE(nodeName,
+            "BF16 dispatch_ffn_combine max_output_size=%u is smaller than worst-case receiver rows=%lu.",
+            info.maxOutputSize, requiredReceiverRows), return ge::GRAPH_FAILED);
+    OP_TILING_CHECK(windowBytes <= COUNT_CONTROL_TAIL_SIZE || countBytes > COUNT_MATRIX_REGION_SIZE,
+        OP_LOGE(nodeName, "BF16 dispatch_ffn_combine count state requires %lu bytes inside a %u-byte region.",
+            countBytes, COUNT_MATRIX_REGION_SIZE), return ge::GRAPH_FAILED);
+    OP_TILING_CHECK(inputBytes > scaleOffset,
+        OP_LOGE(nodeName, "BF16 dispatch_ffn_combine input requires %lu bytes before peer-scale offset %lu.",
+            inputBytes, scaleOffset), return ge::GRAPH_FAILED);
+    OP_TILING_CHECK(outputOffset > countOffset || outputBytes > countOffset - outputOffset,
+        OP_LOGE(nodeName, "BF16 dispatch_ffn_combine output requires %lu bytes, but HCCL_BUFFSIZE=%lu MiB leaves %lu bytes.",
+            outputBytes, windowBytes / MB_SIZE, outputOffset <= countOffset ? countOffset - outputOffset : 0),
+        return ge::GRAPH_FAILED);
+    OP_TILING_CHECK(countOffset + countBytes > windowBytes - CONTROL_REGION_SIZE,
+        OP_LOGE(nodeName, "BF16 dispatch_ffn_combine HCCL window control/count regions overlap."),
+        return ge::GRAPH_FAILED);
+
+    return ge::GRAPH_SUCCESS;
+}
 
 static int32_t CeilDev(int32_t num, int32_t div)
 {
@@ -65,6 +168,8 @@ static ge::graphStatus DispatchFFNCombineBF16CheckAttrAndSetTiling(gert::TilingC
     auto weight_nz = attrs->GetAttrPointer<bool>(ATTR_WEIGHT_NZ);
     OP_TILING_CHECK(groupPtr == nullptr || strlen(groupPtr) == 0,
     OP_LOGE(K_INNER_DEBUG, "group is invalid."), return GRAPH_FAILED);
+    OP_TILING_CHECK(maxOutputSizePtr == nullptr || *maxOutputSizePtr <= 0,
+        OP_LOGE(K_INNER_DEBUG, "max_output_size must be positive."), return GRAPH_FAILED);
 
     OP_TILING_CHECK(is_trans_b == nullptr,
         OP_LOGE(K_INNER_DEBUG, "is_trans_b is invalid."), return GRAPH_FAILED);
@@ -91,14 +196,36 @@ static ge::graphStatus DispatchFFNCombineBF16CheckShapeAndSetTiling(gert::Tiling
 
     const gert::StorageShape *aStorageShape = context->GetInputShape(X_INDEX);
     auto expertIdxTensor = context->GetDynamicInputTensor(EXPERTID_INDEX, 0);
+    const gert::StorageShape *probsShape = context->GetInputShape(PROBS_INDEX);
+    const gert::StorageShape *outShape = context->GetOutputShape(OUT_INDEX);
+    const gert::StorageShape *expertTokenNumsShape = context->GetOutputShape(EXPERT_TOKEN_NUMS_INDEX);
+    OP_TILING_CHECK(aStorageShape == nullptr || aStorageShape->GetStorageShape().GetDimNum() != 2,
+        OP_LOGE(nodeName, "a must be a rank-2 tensor."), return ge::GRAPH_FAILED);
+    OP_TILING_CHECK(expertIdxTensor == nullptr || expertIdxTensor->GetStorageShape().GetDimNum() != 2,
+        OP_LOGE(nodeName, "expert_idx must be a rank-2 tensor."), return ge::GRAPH_FAILED);
+    OP_TILING_CHECK(probsShape == nullptr || probsShape->GetStorageShape().GetDimNum() != 2,
+        OP_LOGE(nodeName, "probs must be a rank-2 tensor."), return ge::GRAPH_FAILED);
+    OP_TILING_CHECK(outShape == nullptr || outShape->GetStorageShape().GetDimNum() != 2,
+        OP_LOGE(nodeName, "out must be a rank-2 tensor."), return ge::GRAPH_FAILED);
+    OP_TILING_CHECK(expertTokenNumsShape == nullptr || expertTokenNumsShape->GetStorageShape().GetDimNum() != 1,
+        OP_LOGE(nodeName, "expert_token_nums must be a rank-1 tensor."), return ge::GRAPH_FAILED);
     uint32_t M = aStorageShape->GetStorageShape().GetDim(0);
     uint32_t K = aStorageShape->GetStorageShape().GetDim(1);
 
     auto wTensor = context->GetDynamicInputTensor(WEIGHT_INDEX, 0);
+    auto w2Tensor = context->GetDynamicInputTensor(WEIGHT2_INDEX, 0);
+    OP_TILING_CHECK(wTensor == nullptr || w2Tensor == nullptr,
+        OP_LOGE(nodeName, "w1 and w2 must each contain at least one tensor."), return ge::GRAPH_FAILED);
     uint32_t wTensorDims = wTensor->GetOriginShape().GetDimNum();
+    OP_TILING_CHECK(wTensorDims == 0 || wTensor->GetStorageShape().GetDimNum() < wTensorDims,
+        OP_LOGE(nodeName, "w1 has an invalid storage/origin shape."), return ge::GRAPH_FAILED);
     uint32_t N = wTensor->GetStorageShape().GetDim(wTensorDims - 1);
 
     uint32_t topK = expertIdxTensor->GetStorageShape().GetDim(1);
+    OP_TILING_CHECK(expertIdxTensor->GetStorageShape().GetDim(0) != M ||
+        probsShape->GetStorageShape().GetDim(0) != M || probsShape->GetStorageShape().GetDim(1) != topK,
+        OP_LOGE(nodeName, "expert_idx and probs must both have shape [M, top_k]."),
+        return ge::GRAPH_FAILED);
     uint32_t listLen = 0;
     while (true) {
         auto wTensorT = context->GetDynamicInputTensor(WEIGHT_INDEX, ++listLen);
@@ -111,6 +238,12 @@ static ge::graphStatus DispatchFFNCombineBF16CheckShapeAndSetTiling(gert::Tiling
     } else {
         expertPerRank = listLen;
     }
+    OP_TILING_CHECK(outShape->GetStorageShape().GetDim(0) != M ||
+        outShape->GetStorageShape().GetDim(1) != K,
+        OP_LOGE(nodeName, "out must have shape [M, K]."), return ge::GRAPH_FAILED);
+    OP_TILING_CHECK(expertTokenNumsShape->GetStorageShape().GetDim(0) != expertPerRank,
+        OP_LOGE(nodeName, "expert_token_nums length must equal local experts=%u.", expertPerRank),
+        return ge::GRAPH_FAILED);
 
     info.M = M;
     info.N = N;
@@ -140,6 +273,24 @@ static ge::graphStatus DispatchFFNCombineBF16GetPlatformInfoAndSetTiling(gert::T
     OP_LOGD(K_INNER_DEBUG, "aivNum=%d", info.aivNum);
     OP_LOGD(K_INNER_DEBUG, "ubSize=%lu", info.totalUbSize);
 
+    return ge::GRAPH_SUCCESS;
+}
+
+static ge::graphStatus CheckXActiveMaskShape(
+    gert::TilingContext *context, const char *nodeName, const DispatchFFNCombineBF16Info &info)
+{
+    const gert::StorageShape *maskShape = context->GetOptionalInputShape(X_ACTIVE_MASK_INDEX);
+    if (maskShape == nullptr) {
+        return ge::GRAPH_SUCCESS;
+    }
+
+    const gert::Shape &storageShape = maskShape->GetStorageShape();
+    OP_TILING_CHECK(storageShape.GetDimNum() != 1,
+        OP_LOGE(nodeName, "x_active_mask must be rank 1, got rank %lu.", storageShape.GetDimNum()),
+        return ge::GRAPH_FAILED);
+    OP_TILING_CHECK(storageShape.GetDim(0) != static_cast<int64_t>(info.M),
+        OP_LOGE(nodeName, "x_active_mask length must equal local tokens M=%u, got %ld.",
+            info.M, storageShape.GetDim(0)), return ge::GRAPH_FAILED);
     return ge::GRAPH_SUCCESS;
 }
 
@@ -179,6 +330,12 @@ static ge::graphStatus DispatchFFNCombineBF16TilingFuncImpl(gert::TilingContext 
     OP_TILING_CHECK(DispatchFFNCombineBF16GetPlatformInfoAndSetTiling(context, info) != ge::GRAPH_SUCCESS,
         OP_LOGE(context->GetNodeName(), "DispatchFFNCombineBF16 GetPlatformInfoAndSetTiling Failed"),
         return ge::GRAPH_FAILED);
+    OP_TILING_CHECK(CheckXActiveMaskShape(context, nodeName, info) != ge::GRAPH_SUCCESS,
+        OP_LOGE(nodeName, "DispatchFFNCombineBF16 x_active_mask validation failed"),
+        return ge::GRAPH_FAILED);
+    OP_TILING_CHECK(DispatchFFNCombineBF16CheckPhysicalDomain(context, info) != ge::GRAPH_SUCCESS,
+        OP_LOGE(context->GetNodeName(), "DispatchFFNCombineBF16 physical-domain validation failed"),
+        return ge::GRAPH_FAILED);
 
     SetTilingData(tilingData->cocTiling, info);
 
@@ -203,7 +360,8 @@ static ge::graphStatus DispatchFFNCombineBF16TilingFuncImpl(gert::TilingContext 
     int64_t scaleDim0 = 0;
     int64_t ubSize = 196352;
     int64_t expertCapacity = 0;
-    int64_t expertNum = info.expertPerRank * info.worldSize;
+    // The final ID is a sentinel used only for inactive graph-padding rows.
+    int64_t expertNum = info.expertPerRank * info.worldSize + 1;
     int64_t activeNum = info.M * info.topK;
     int64_t dropPadMode = 0;
      int64_t expertTokensCountOrCumsumFlag = 2;
@@ -234,19 +392,28 @@ static ge::graphStatus DispatchFFNCombineBF16TilingFuncImpl(gert::TilingContext 
     uint32_t n2 = info.K;
     uint32_t k2 = info.N / 2;
 
-    uint64_t cocWorkspace = (info.M + 256 - 1) / 256 * 256 * info.topK *sizeof(int32_t) +
-                            info.worldSize * info.worldSize * info.expertPerRank * sizeof(int32_t) * 3 +
-                            info.maxOutputSize * sizeof(float) * 2 +
-                            info.maxOutputSize * info.N * sizeof(int16_t) +
-                            info.maxOutputSize * n2 * sizeof(int16_t) +
-                            info.maxOutputSize * info.K * sizeof(int16_t) +
-                            info.maxOutputSize * k2 * sizeof(int16_t) +
-                            info.worldSize * sizeof(int32_t) * 16 +
-                            (info.expertPerRank + info.worldSize) * sizeof(int32_t) * 16;
+    const uint64_t expandedRowIdxWorkspace =
+        static_cast<uint64_t>((info.M + 256 - 1) / 256) * 256 * info.topK * sizeof(int32_t);
+    const uint64_t expertIdxScratchWorkspace =
+        (static_cast<uint64_t>(info.M) * info.topK * sizeof(int32_t) + 32 - 1) / 32 * 32;
+    const uint64_t countMatrixWorkspace =
+        static_cast<uint64_t>(info.worldSize) * info.worldSize * info.expertPerRank * sizeof(int32_t);
+    uint64_t cocWorkspace = expandedRowIdxWorkspace +
+                            std::max(expertIdxScratchWorkspace, countMatrixWorkspace) +
+                            countMatrixWorkspace * 2 +
+                            static_cast<uint64_t>(info.maxOutputSize) * sizeof(float) * 2 +
+                            static_cast<uint64_t>(info.maxOutputSize) * info.N * sizeof(int16_t) +
+                            static_cast<uint64_t>(info.maxOutputSize) * n2 * sizeof(int16_t) +
+                            static_cast<uint64_t>(info.maxOutputSize) * info.K * sizeof(int16_t) +
+                            static_cast<uint64_t>(info.maxOutputSize) * k2 * sizeof(int16_t) +
+                            static_cast<uint64_t>(info.worldSize) * sizeof(int32_t) * 16 +
+                            static_cast<uint64_t>(info.expertPerRank + info.worldSize) * sizeof(int32_t) * 16;
                             // std::max(info.maxOutputSize * info.N * sizeof(int16_t), info.maxOutputSize * n2 * sizeof(int16_t)) +
                             // std::max(info.maxOutputSize * info.K * sizeof(int8_t), info.maxOutputSize * k2 * sizeof(int8_t));
 
-    workSpaces[0] = SYSTEM_NEED_WORKSPACE + std::max(cocWorkspace, initRoutingWorkspace);
+    const uint64_t routingWorkspace =
+        expandedRowIdxWorkspace + expertIdxScratchWorkspace + initRoutingWorkspace;
+    workSpaces[0] = SYSTEM_NEED_WORKSPACE + std::max(cocWorkspace, routingWorkspace);
 
 
     // 5. communication

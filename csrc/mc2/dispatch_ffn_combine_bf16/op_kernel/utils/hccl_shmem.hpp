@@ -1,7 +1,7 @@
 #ifndef SYNC_UTIL_HPP
 #define SYNC_UTIL_HPP
 
-
+#include <cstddef>
 #include "kernel_operator.h"
 #include "const_args.hpp"
 
@@ -22,6 +22,31 @@ constexpr uint16_t RECV_SYNC_EVENT_ID = 10;
 
 constexpr uint32_t SELF_STATE_OFFSET = 256 * 1024;
 constexpr uint32_t STATE_OFFSET = 512;
+
+// A2 and A3 use different full HCCL context structures, but the fields needed
+// by this operator form the same ABI prefix on both targets. Keep that
+// dependency explicit and compile-time checked instead of interpreting an A2
+// context as the much larger A3-only HcclOpResParamCustom structure.
+struct HcclWindowContextPrefix {
+    uint64_t workSpace;
+    uint64_t workSpaceSize;
+    uint32_t rankId;
+    uint32_t rankSize;
+    uint64_t winSize;
+};
+
+static_assert(offsetof(HcclWindowContextPrefix, rankId) ==
+              offsetof(HcclOpResParamCustom, localUsrRankId));
+static_assert(offsetof(HcclWindowContextPrefix, rankSize) ==
+              offsetof(HcclOpResParamCustom, rankSize));
+static_assert(offsetof(HcclWindowContextPrefix, winSize) ==
+              offsetof(HcclOpResParamCustom, winSize));
+static_assert(offsetof(HcclWindowContextPrefix, rankId) ==
+              offsetof(HcclA2CombineOpParam, rankId));
+static_assert(offsetof(HcclWindowContextPrefix, rankSize) ==
+              offsetof(HcclA2CombineOpParam, rankNum));
+static_assert(offsetof(HcclWindowContextPrefix, winSize) ==
+              offsetof(HcclA2CombineOpParam, winSize));
 
 FORCE_INLINE_AICORE void AicSyncAll() {
     AscendC::CrossCoreSetFlag<0x0, PIPE_FIX>(8);
@@ -84,17 +109,23 @@ FORCE_INLINE_AICORE void gm_signal_wait_until_ne(__gm__ int32_t *sig_addr, int32
 class HcclShmem {
 public:
     #ifdef HCCL_COMM    // HCCL needs to initialize the HCCL context
-        __gm__ HcclOpResParamCustom *WinContext_{nullptr};
         Hccl<HCCL_SERVER_TYPE_AICPU> hccl_;
         AscendC::LocalTensor<int32_t> ub;
         FORCE_INLINE_AICORE
         HcclShmem(){
             auto contextGM0 = AscendC::GetHcclContext<HCCL_GROUP_ID_0>();
-            WinContext_ = (__gm__ HcclOpResParamCustom *)contextGM0;
+            auto contextPrefix = reinterpret_cast<__gm__ HcclWindowContextPrefix *>(contextGM0);
+            m_rank = contextPrefix->rankId;
+            m_rankSize = contextPrefix->rankSize;
+            m_segmentSize = contextPrefix->winSize;
+        }
 
-            m_rank = WinContext_->localUsrRankId;
-            m_rankSize = WinContext_->rankSize;
-            m_segmentSize = WinContext_->winSize;
+        FORCE_INLINE_AICORE
+        void initHccl(GM_ADDR initTiling) {
+            auto contextGM0 = AscendC::GetHcclContext<HCCL_GROUP_ID_0>();
+            hccl_.Init(contextGM0, reinterpret_cast<__gm__ void *>(initTiling));
+            m_rank = hccl_.GetRankId();
+            m_rankSize = hccl_.GetRankDim();
         }
     #else
         FORCE_INLINE_AICORE
@@ -110,26 +141,25 @@ public:
     #endif
 
     FORCE_INLINE_AICORE
-    GM_ADDR operator() () const {   // No parameters: return pointer to local peermem
+    GM_ADDR operator() () {   // No parameters: return pointer to local peermem
         #ifdef HCCL_COMM
-            return (GM_ADDR)(WinContext_->localWindowsIn);
+            return hccl_.GetWindowsInAddr(m_rank);
         #else
             return reinterpret_cast<GM_ADDR>(shmem_ptr(symmetricPtr, m_rank));
         #endif
     }
 
     FORCE_INLINE_AICORE
-    GM_ADDR operator() (int32_t index) const {  // With index parameter: return pointer to the base address of remote peermem
+    GM_ADDR operator() (int32_t index) {  // With index parameter: return pointer to the base address of remote peermem
         #ifdef HCCL_COMM
-            return (GM_ADDR)((index == m_rank) ? WinContext_->localWindowsIn :
-                                    ((HcclRankRelationResV2Custom *)(WinContext_->remoteRes[index].nextDevicePtr))->windowsIn);
+            return hccl_.GetWindowsInAddr(index);
         #else
             return reinterpret_cast<GM_ADDR>(shmem_ptr(symmetricPtr, index));
         #endif
     }
 
     FORCE_INLINE_AICORE
-    GM_ADDR operator () (int64_t offset, int32_t rankId) const  {  
+    GM_ADDR operator () (int64_t offset, int32_t rankId) {
         #ifdef HCCL_COMM
             if (offset < 0 || offset >= m_segmentSize) {
                 return nullptr;
@@ -137,8 +167,7 @@ public:
             if (rankId < 0 || rankId >= m_rankSize) {
                 return nullptr;
             }
-            return (GM_ADDR)((rankId == m_rank) ? WinContext_->localWindowsIn :
-                                    ((HcclRankRelationResV2Custom *)(WinContext_->remoteRes[rankId].nextDevicePtr))->windowsIn) + offset;
+            return hccl_.GetWindowsInAddr(rankId) + offset;
         #else
             return reinterpret_cast<GM_ADDR>(shmem_ptr((symmetricPtr + offset), rankId));
         #endif

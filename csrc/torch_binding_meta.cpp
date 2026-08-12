@@ -249,6 +249,31 @@ std::tuple<at::Tensor&, at::Tensor&> dispatch_ffn_combine_meta(
     const c10::optional<at::Tensor> &x_active_mask,
     double swiglu_limit
 ) {
+    TORCH_CHECK(x.dim() == 2, "x must be two-dimensional");
+    TORCH_CHECK(expert_idx.dim() == 2, "expert_idx must be two-dimensional");
+    TORCH_CHECK(probs.dim() == 2, "probs must be two-dimensional");
+    TORCH_CHECK(weight1.size() > 0 && weight2.size() > 0,
+                "weight1 and weight2 must each contain at least one tensor");
+    TORCH_CHECK(expert_idx.sym_size(0) == x.sym_size(0),
+                "expert_idx must have one row per input token");
+    TORCH_CHECK(probs.sym_size(0) == x.sym_size(0) && probs.sym_size(1) == expert_idx.sym_size(1),
+                "probs and expert_idx must have the same [tokens, top_k] shape");
+    TORCH_CHECK(out.dim() == 2 && out.sym_size(0) == x.sym_size(0) && out.sym_size(1) == x.sym_size(1),
+                "out must have the same shape as x");
+    TORCH_CHECK(out.scalar_type() == x.scalar_type(), "out must have the same dtype as x");
+    TORCH_CHECK(expert_token_nums.dim() == 1, "expert_token_nums must be one-dimensional");
+    TORCH_CHECK(expert_token_nums.scalar_type() == at::kInt,
+                "expert_token_nums must have int32 dtype");
+    TORCH_CHECK(expert_idx.scalar_type() == at::kInt, "expert_idx must have int32 dtype");
+    TORCH_CHECK(probs.scalar_type() == at::kFloat, "probs must have float32 dtype");
+    TORCH_CHECK(max_output_size > 0, "max_output_size must be positive");
+    if (x_active_mask.has_value()) {
+        TORCH_CHECK(x_active_mask->dim() == 1, "x_active_mask must be one-dimensional");
+        TORCH_CHECK(x_active_mask->scalar_type() == at::kBool, "x_active_mask must have bool dtype");
+        TORCH_CHECK(
+            x_active_mask->sym_size(0) == x.sym_size(0),
+            "x_active_mask must have one entry per input token");
+    }
     return {out, expert_token_nums};
 }
 
