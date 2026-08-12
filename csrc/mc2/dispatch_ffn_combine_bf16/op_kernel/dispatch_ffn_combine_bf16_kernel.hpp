@@ -313,7 +313,11 @@ private:
 
         AscendC::DataCopyPad(
             tmpBuffer1,
-            tokenPerExpert[tokenPerExpertLayout(rankId, 0, 0)],
+            // Layout is [source rank, destination rank, local expert].
+            // Gather this destination's expert column across every source;
+            // starting at [rankId, 0, 0] instead reads one source row and then
+            // steps beyond the final source for nonzero ranks.
+            tokenPerExpert[tokenPerExpertLayout(0, rankId, 0)],
             {U16(EP), U16(expertPerRank * sizeof(int32_t)),
              U16((paddedExpertNumAligned - expertPerRank) * sizeof(int32_t)), 0},
             {}
