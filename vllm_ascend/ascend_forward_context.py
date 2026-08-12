@@ -224,18 +224,30 @@ def _get_num_experts_per_token(vllm_config: VllmConfig) -> int:
 
 
 def _is_a2_fused_bf16_configured(vllm_config: VllmConfig) -> bool:
+    # This predicate is also reached by utility/unit-test call paths before
+    # Ascend's process-global configuration is initialized.  Such a path
+    # cannot have selected the fused family, so keep the probe conservative
+    # instead of turning an ordinary forward-context query into an ordering
+    # requirement on init_ascend_config().
+    if get_ascend_device_type() is not AscendDeviceType.A2:
+        return False
+    try:
+        ascend_config = get_ascend_config()
+    except RuntimeError as error:
+        if "Ascend config is not initialized" not in str(error):
+            raise
+        return False
+
     parallel_config = vllm_config.parallel_config
     ep_world_size = parallel_config.world_size_across_dp // parallel_config.pipeline_parallel_size
     num_experts = vllm_config.model_config.get_num_experts()
     num_local_experts = num_experts // ep_world_size if ep_world_size else 0
     top_k = _get_num_experts_per_token(vllm_config)
-    ascend_config = get_ascend_config()
     eplb_config = getattr(ascend_config, "eplb_config", None)
     dynamic_eplb = bool(getattr(eplb_config, "dynamic_eplb", False))
     redundant_experts = int(getattr(eplb_config, "num_redundant_experts", 0))
     return (
-        get_ascend_device_type() is AscendDeviceType.A2
-        and ascend_config.enable_fused_mc2 == 1
+        ascend_config.enable_fused_mc2 == 1
         and _get_quant_type(vllm_config) is None
         and getattr(vllm_config.model_config, "dtype", None) == torch.bfloat16
         and parallel_config.enable_expert_parallel
