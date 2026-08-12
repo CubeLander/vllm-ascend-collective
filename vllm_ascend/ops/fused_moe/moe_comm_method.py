@@ -19,10 +19,11 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass
 
 import torch
+from vllm.distributed import get_ep_group, get_tensor_model_parallel_world_size
 from vllm.model_executor.layers.fused_moe import FusedMoEConfig
 
 from vllm_ascend.ascend_config import get_ascend_config
-from vllm_ascend.ascend_forward_context import _EXTRA_CTX, MoECommType
+from vllm_ascend.ascend_forward_context import _EXTRA_CTX, MoECommType, get_mc2_tokens_capacity
 from vllm_ascend.ops.fused_moe.moe_mlp import unified_apply_mlp
 from vllm_ascend.ops.fused_moe.moe_runtime_args import (
     MoEFusedExpertsInput,
@@ -44,6 +45,9 @@ from vllm_ascend.ops.fused_moe.token_dispatcher import (
     TokenDispatcherWithMC2,
 )
 from vllm_ascend.quantization.quant_type import QuantType
+from vllm_ascend.utils import AscendDeviceType, get_ascend_device_type
+
+DEFAULT_FUSED_MC2_MAX_ROUTED_TOKENS = 131072
 
 _MoECommMethods: dict[MoECommType | None, MoECommMethod] = {}
 
@@ -274,6 +278,16 @@ class FusedMC2CommImpl(MoECommMethod):
             self.expert_token_nums = torch.zeros([self.moe_config.num_local_experts], dtype=torch.int32, device="npu")
         else:
             self.expert_token_nums = None
+        self.max_output_size = DEFAULT_FUSED_MC2_MAX_ROUTED_TOKENS
+        if get_ascend_device_type() is AscendDeviceType.A2 and get_ascend_config().enable_fused_mc2 == 1:
+            capacity = get_mc2_tokens_capacity()
+            if capacity is None:
+                raise RuntimeError("A2 BF16 fused MC2 capacity must be initialized before its communication method")
+            tp_size = get_tensor_model_parallel_world_size()
+            ep_size = get_ep_group().world_size
+            local_capacity = (capacity + tp_size - 1) // tp_size
+            # Worst case: every source rank sends all top-k rows to this rank.
+            self.max_output_size = local_capacity * ep_size * self.moe_config.experts_per_token
 
     def pad_and_split_input_ids(self, input_ids):
         return self.prepare_finalize.pad_and_split_input_ids(input_ids)  # type: ignore[attr-defined]
@@ -307,6 +321,12 @@ class FusedMC2CommImpl(MoECommMethod):
                 fused_experts_input.weights.w1_scale_bias is None or fused_experts_input.weights.w2_scale_bias is None
             ), "w1_scale_bias and w2_scale_bias cannot be None when enable_fused_mc2=1."
 
+            routed_rows = fused_experts_input.hidden_states.shape[0] * topk_ids.shape[1]
+            if routed_rows > self.max_output_size:
+                raise RuntimeError(
+                    "dispatch_ffn_combine input exceeds its startup routed-row capacity "
+                    f"({routed_rows} > {self.max_output_size})"
+                )
             out = torch.empty_like(fused_experts_input.hidden_states)
             torch.ops._C_ascend.dispatch_ffn_combine(  # type: ignore
                 x=fused_experts_input.hidden_states,
@@ -319,7 +339,7 @@ class FusedMC2CommImpl(MoECommMethod):
                 bias2=fused_experts_input.weights.w2_scale_bias,
                 probs=fused_experts_input.topk_weights.to(torch.float32),
                 group=self.token_dispatcher.moe_all_to_all_group_name,
-                max_output_size=131072,
+                max_output_size=self.max_output_size,
                 swiglu_limit=fused_experts_input.swiglu_limit,
                 x_active_mask=fused_experts_input.routing.mc2_mask,
                 out=out,

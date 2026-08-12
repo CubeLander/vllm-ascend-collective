@@ -1,4 +1,3 @@
-import math
 from contextlib import contextmanager
 from enum import Enum
 from typing import Any
@@ -28,6 +27,13 @@ class MoECommType(Enum):
     MC2 = 1
     ALLTOALL = 2
     FUSED_MC2 = 3
+
+
+MAX_A2_FUSED_MC2_EP_SIZE = 8
+MIN_A2_FUSED_MC2_LOCAL_EXPERTS = 3
+MAX_A2_FUSED_MC2_LOCAL_EXPERTS = 64
+MAX_A2_FUSED_MC2_TOP_K = 8
+MAX_A2_FUSED_MC2_LOCAL_TOKENS = 512
 
 
 _mrv2_in_profile_run: bool = False
@@ -97,7 +103,8 @@ def set_ascend_forward_context(
         from vllm_ascend.ops.fused_moe.moe_comm_method import get_moe_comm_method
 
         max_num_tokens = int(num_tokens_across_dp.max().item()) if num_tokens_across_dp is not None else num_tokens
-        moe_comm_type = select_moe_comm_method(max_num_tokens, vllm_config, is_draft_model)
+        selection_num_tokens = max_num_tokens if _is_a2_fused_bf16_configured(vllm_config) else num_tokens
+        moe_comm_type = select_moe_comm_method(selection_num_tokens, vllm_config, is_draft_model)
 
         forward_context.moe_comm_type = moe_comm_type
         forward_context.moe_comm_method = get_moe_comm_method(moe_comm_type)
@@ -184,7 +191,11 @@ def set_ascend_forward_context(
             if num_actual_tokens is None:
                 num_actual_tokens = num_tokens
             # NOTE: token num which need to pad to when mc2
-            forward_context.padded_num_tokens = math.ceil(max_tokens_across_dp / tp_world_size) * tp_world_size
+            forward_context.padded_num_tokens = get_mc2_padded_num_tokens(
+                max_tokens_across_dp,
+                tp_world_size,
+                moe_comm_type,
+            )
             reserved_mc2_mask = get_mc2_mask()
             if reserved_mc2_mask is not None:
                 mc2_mask = reserved_mc2_mask[: forward_context.padded_num_tokens]
@@ -198,39 +209,134 @@ def set_ascend_forward_context(
 
 
 _mc2_tokens_capacity: int | None = None
+_mc2_tokens_limit: int | None = None
 _reserved_mc2_mask: torch.Tensor | None = None
 
 
-def set_mc2_tokens_capacity(vllm_config, max_num_reqs, uniform_decode_query_len):
-    global _mc2_tokens_capacity
-    if _mc2_tokens_capacity is not None:
-        return
-    if get_ascend_config().enable_prefill_mc2:
-        max_num_tokens = vllm_config.scheduler_config.max_num_batched_tokens
-    elif vllm_config.compilation_config.cudagraph_capture_sizes:
-        max_num_tokens = vllm_config.compilation_config.max_cudagraph_capture_size
-    else:
-        max_num_tokens = max_num_reqs * uniform_decode_query_len
+def _get_quant_type(vllm_config: VllmConfig):
+    hf_text_config = vllm_config.model_config.hf_text_config
+    return getattr(hf_text_config, "moe_quantize", getattr(hf_text_config, "quantize", None))
+
+
+def _get_num_experts_per_token(vllm_config: VllmConfig) -> int:
+    hf_text_config = vllm_config.model_config.hf_text_config
+    return getattr(hf_text_config, "num_experts_per_tok", getattr(hf_text_config, "top_k_experts", 1))
+
+
+def _is_a2_fused_bf16_configured(vllm_config: VllmConfig) -> bool:
+    parallel_config = vllm_config.parallel_config
+    ep_world_size = parallel_config.world_size_across_dp // parallel_config.pipeline_parallel_size
+    num_experts = vllm_config.model_config.get_num_experts()
+    num_local_experts = num_experts // ep_world_size if ep_world_size else 0
+    top_k = _get_num_experts_per_token(vllm_config)
+    ascend_config = get_ascend_config()
+    eplb_config = getattr(ascend_config, "eplb_config", None)
+    dynamic_eplb = bool(getattr(eplb_config, "dynamic_eplb", False))
+    redundant_experts = int(getattr(eplb_config, "num_redundant_experts", 0))
+    return (
+        get_ascend_device_type() is AscendDeviceType.A2
+        and ascend_config.enable_fused_mc2 == 1
+        and _get_quant_type(vllm_config) is None
+        and getattr(vllm_config.model_config, "dtype", None) == torch.bfloat16
+        and parallel_config.enable_expert_parallel
+        and 1 < ep_world_size <= MAX_A2_FUSED_MC2_EP_SIZE
+        and num_experts % ep_world_size == 0
+        and MIN_A2_FUSED_MC2_LOCAL_EXPERTS <= num_local_experts <= MAX_A2_FUSED_MC2_LOCAL_EXPERTS
+        and 1 <= top_k <= MAX_A2_FUSED_MC2_TOP_K
+        and not dynamic_eplb
+        and redundant_experts == 0
+    )
+
+
+def _round_up_to_multiple(value: int, multiple: int) -> int:
+    return (value + multiple - 1) // multiple * multiple
+
+
+def _compute_mc2_tokens_limit(vllm_config, max_num_reqs, uniform_decode_query_len) -> int:
+    if _is_a2_fused_bf16_configured(vllm_config) or get_ascend_config().enable_prefill_mc2:
+        return vllm_config.scheduler_config.max_num_batched_tokens
+    if vllm_config.compilation_config.cudagraph_capture_sizes:
+        return vllm_config.compilation_config.max_cudagraph_capture_size
+    return max_num_reqs * uniform_decode_query_len
+
+
+def _compute_mc2_tokens_capacity(vllm_config, max_num_reqs, uniform_decode_query_len) -> int:
+    max_num_tokens = _compute_mc2_tokens_limit(vllm_config, max_num_reqs, uniform_decode_query_len)
     tp_size = vllm_config.parallel_config.tensor_parallel_size
-    # Use integer arithmetic for ceiling division.
-    num_tokens_per_tp_rank = (max_num_tokens + tp_size - 1) // tp_size
-    # NOTE: To save memory, we cap the max number of tokens to 512.
-    num_tokens_per_tp_rank = min(num_tokens_per_tp_rank, 512)
-    _mc2_tokens_capacity = num_tokens_per_tp_rank * tp_size
+    local_capacity = (max_num_tokens + tp_size - 1) // tp_size
+    if _is_a2_fused_bf16_configured(vllm_config):
+        if local_capacity > MAX_A2_FUSED_MC2_LOCAL_TOKENS:
+            raise ValueError(
+                "A2 BF16 fused MC2 requires ceil(max_num_batched_tokens / "
+                f"tensor_parallel_size) <= {MAX_A2_FUSED_MC2_LOCAL_TOKENS}, got {local_capacity}."
+            )
+    else:
+        local_capacity = min(local_capacity, 512)
+    return local_capacity * tp_size
+
+
+def set_mc2_tokens_capacity(vllm_config, max_num_reqs, uniform_decode_query_len):
+    global _mc2_tokens_capacity, _mc2_tokens_limit
+    a2_fused_bf16 = _is_a2_fused_bf16_configured(vllm_config)
+    if get_ascend_device_type() is AscendDeviceType.A2 and get_ascend_config().enable_fused_mc2 == 1 and not a2_fused_bf16:
+        if getattr(vllm_config, "speculative_config", None) is not None:
+            raise ValueError("A2 BF16 fused MC2 does not support draft/MTP execution.")
+        raise ValueError(
+            "A2 enable_fused_mc2=1 requires unquantized BF16, EP 2..8, 3..64 local experts, "
+            "top-k 1..8, and no dynamic or redundant EPLB experts."
+        )
+    max_num_tokens = _compute_mc2_tokens_limit(vllm_config, max_num_reqs, uniform_decode_query_len)
+    requested_capacity = _compute_mc2_tokens_capacity(vllm_config, max_num_reqs, uniform_decode_query_len)
+    if _mc2_tokens_capacity is None:
+        _mc2_tokens_capacity = requested_capacity
+        _mc2_tokens_limit = max_num_tokens
+    elif not a2_fused_bf16:
+        # Preserve the historical process-global first-run behavior for every
+        # ordinary MC2 implementation. Only this new immutable A2 family needs
+        # strict agreement between compiled runners.
+        return
+    elif _mc2_tokens_capacity != requested_capacity or _mc2_tokens_limit != max_num_tokens:
+        raise RuntimeError(
+            "MC2 capacity was already initialized for a different execution domain "
+            f"(limit/capacity {_mc2_tokens_limit}/{_mc2_tokens_capacity} != "
+            f"{max_num_tokens}/{requested_capacity})."
+        )
 
 
 def get_mc2_tokens_capacity():
     return _mc2_tokens_capacity
 
 
+def get_mc2_tokens_limit():
+    return _mc2_tokens_limit
+
+
 def set_mc2_mask(vllm_config, device):
     global _reserved_mc2_mask
     if _reserved_mc2_mask is not None:
+        if _is_a2_fused_bf16_configured(vllm_config):
+            tp_size = vllm_config.parallel_config.tensor_parallel_size
+            scheduler_capacity = _round_up_to_multiple(
+                vllm_config.scheduler_config.max_num_batched_tokens,
+                tp_size,
+            )
+            expected_capacity = max(_mc2_tokens_capacity or 0, scheduler_capacity)
+            if _reserved_mc2_mask.numel() != expected_capacity or _reserved_mc2_mask.device != torch.device(device):
+                raise RuntimeError(
+                    "A2 BF16 fused MC2 active-mask storage was already initialized "
+                    "for a different capacity or device."
+                )
         return
     if is_moe_model(vllm_config):
-        _reserved_mc2_mask = torch.zeros(
-            vllm_config.scheduler_config.max_num_batched_tokens, dtype=torch.bool, device=device
+        if _mc2_tokens_capacity is None:
+            raise RuntimeError("MC2 token capacity must be initialized before its active mask")
+        tp_size = vllm_config.parallel_config.tensor_parallel_size
+        scheduler_capacity = _round_up_to_multiple(
+            vllm_config.scheduler_config.max_num_batched_tokens,
+            tp_size,
         )
+        mask_capacity = max(_mc2_tokens_capacity, scheduler_capacity)
+        _reserved_mc2_mask = torch.zeros(mask_capacity, dtype=torch.bool, device=device)
     else:
         _reserved_mc2_mask = None
 
@@ -239,14 +345,25 @@ def get_mc2_mask():
     return _reserved_mc2_mask
 
 
+def get_mc2_padded_num_tokens(
+    max_num_tokens: int,
+    tp_world_size: int,
+    moe_comm_type: MoECommType | None,
+) -> int:
+    padded_num_tokens = _round_up_to_multiple(max_num_tokens, tp_world_size)
+    return padded_num_tokens
+
+
 def select_moe_comm_method(num_tokens: int, vllm_config: VllmConfig, is_draft_model=False) -> MoECommType | None:
     """Select the MoE communication method according to parallel settings,
     device generation, token count, and quantization.
 
     1. Non-MoE models return `None`.
     2. Without expert parallel, fall back to all-gather.
-    3. On A2 with expert parallel, pick MC2 when tokens fit the MC2 capacity
-       and the DP size is large enough; otherwise use all-gather.
+    3. On A2 with expert parallel, use the floating-point fused MC2 path when
+       explicitly enabled for a small EP group with enough local experts for
+       the kernel pipeline. Otherwise, pick MC2 when tokens fit the MC2
+       capacity and the DP size is large enough, or fall back to all-gather.
     4. On A3 with expert parallel, prefer fused MC2 when using w8a8_dynamic
        quantization with small EP size, no dynamic_eplb, and not in MTP
        mode; otherwise use MC2 within capacity or all-to-all.
@@ -270,11 +387,7 @@ def select_moe_comm_method(num_tokens: int, vllm_config: VllmConfig, is_draft_mo
         return None
     mc2_tokens_capacity = get_mc2_tokens_capacity()
     soc_version = get_ascend_device_type()
-    quant_type = getattr(
-        vllm_config.model_config.hf_text_config,
-        "moe_quantize",
-        getattr(vllm_config.model_config.hf_text_config, "quantize", None),
-    )
+    quant_type = _get_quant_type(vllm_config)
 
     if not vllm_config.parallel_config.enable_expert_parallel or get_ep_group().world_size == 1:
         moe_comm_type = MoECommType.ALLGATHER
@@ -284,7 +397,18 @@ def select_moe_comm_method(num_tokens: int, vllm_config: VllmConfig, is_draft_mo
             vllm_config.parallel_config.world_size_across_dp // vllm_config.parallel_config.pipeline_parallel_size
         )
         num_experts_per_device = num_experts // ep_world_size
-        if num_experts_per_device <= 24 and ep_world_size >= 16 and num_tokens <= mc2_tokens_capacity:
+        fused_float_enable = _is_a2_fused_bf16_configured(vllm_config) and not is_draft_model
+        if fused_float_enable:
+            mc2_tokens_limit = get_mc2_tokens_limit()
+            if mc2_tokens_limit is None:
+                raise RuntimeError("A2 BF16 fused MC2 token domain was not initialized")
+            if num_tokens > mc2_tokens_limit:
+                raise RuntimeError(
+                    "A2 BF16 fused MC2 received a batch outside the scheduler domain "
+                    f"profiled at startup ({num_tokens} > {mc2_tokens_limit})."
+                )
+            moe_comm_type = MoECommType.FUSED_MC2
+        elif num_experts_per_device <= 24 and ep_world_size >= 16 and num_tokens <= mc2_tokens_capacity:
             moe_comm_type = MoECommType.MC2
         else:
             moe_comm_type = MoECommType.ALLGATHER

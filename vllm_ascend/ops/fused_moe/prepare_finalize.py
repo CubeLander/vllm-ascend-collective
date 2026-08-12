@@ -30,7 +30,7 @@ from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.fused_moe import FusedMoEConfig
 
 from vllm_ascend.ascend_config import get_ascend_config
-from vllm_ascend.ascend_forward_context import _EXTRA_CTX
+from vllm_ascend.ascend_forward_context import _EXTRA_CTX, get_mc2_mask
 from vllm_ascend.distributed.utils import fc3_all_gather_and_maybe_unpad_impl
 from vllm_ascend.ops.fused_moe.moe_runtime_args import MoEPrepareOutput
 from vllm_ascend.quantization.quant_type import QuantType
@@ -268,12 +268,6 @@ class PrepareAndFinalizeWithMC2(PrepareAndFinalizeWithAll2All):
         """
         self.replace_allreduce = replace_allreduce
         self.enable_shared_expert_dp = enable_shared_expert_dp
-        mc2_mask = _EXTRA_CTX.mc2_mask
-        if self.tp_size > 1:
-            # Also slice mc2_mask
-            split_mc2_mask = torch.tensor_split(mc2_mask, self.tp_size, dim=0)
-            mc2_mask = split_mc2_mask[self.tp_rank]
-
         padded_hidden_states_shape = hidden_states.shape
         if not self.replace_allreduce:
             self.num_tokens, _ = hidden_states.shape
@@ -292,6 +286,21 @@ class PrepareAndFinalizeWithMC2(PrepareAndFinalizeWithAll2All):
                 split_router_logits = torch.tensor_split(router_logits, self.tp_size, dim=0)
                 hidden_states = split_hidden_states[self.tp_rank]
                 router_logits = split_router_logits[self.tp_rank]
+
+        # Derive the view from the stable, maximum-capacity mask and the
+        # post-prepare hidden-state shape. Capturing the short-lived
+        # ``_EXTRA_CTX.mc2_mask`` view specializes its length at the first
+        # profile batch (for example 16 rows) and can later feed that stale
+        # view to a dynamic 2048-row graph invocation.
+        reserved_mc2_mask = get_mc2_mask()
+        if reserved_mc2_mask is None:
+            mc2_mask = None
+        else:
+            local_num_tokens = hidden_states.shape[0]
+            mask_offset = 0
+            if self.tp_size > 1 and not (self.replace_allreduce or self.enable_shared_expert_dp):
+                mask_offset = self.tp_rank * local_num_tokens
+            mc2_mask = reserved_mc2_mask.narrow(0, mask_offset, local_num_tokens)
 
         return MoEPrepareOutput(
             hidden_states=hidden_states,
